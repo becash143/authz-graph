@@ -20,6 +20,8 @@ const (
 	NodeK8sServiceAccount NodeKind = "k8s_service_account"
 	NodeK8sRole           NodeKind = "k8s_role"
 	NodeK8sClusterRole    NodeKind = "k8s_cluster_role"
+	NodeK8sUser           NodeKind = "k8s_user"
+	NodeK8sGroup          NodeKind = "k8s_group"
 )
 
 // Node is any principal or role/policy-bearing entity in the graph.

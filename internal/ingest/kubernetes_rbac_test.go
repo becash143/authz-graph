@@ -71,4 +71,30 @@ func TestKubernetesRBAC_AgainstFakeSteampipe(t *testing.T) {
 	if !found {
 		t.Fatalf("expected bootstrap-signer to be flagged in UnresolvedPrincipals, got %+v", result.UnresolvedPrincipals)
 	}
+
+	// The fake fixture also binds ClusterRole eks:fargate-scheduler to
+	// User subject "eks:fargate-scheduler" -- a built-in EKS identity
+	// with no backing k8s object at all (unlike ServiceAccounts, there
+	// is no list query that could ever return it). This must be
+	// queryable via why/effective rather than erroring "unknown
+	// principal", since the binding itself proves the principal has
+	// real access that a security tool needs to be able to audit.
+	paths, err = graph.WhyAccess(g, "k8s:User/eks:fargate-scheduler", "get", "pods")
+	if err != nil {
+		t.Fatalf("WhyAccess for auto-vivified User principal: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path for eks:fargate-scheduler's inferred access, got %d: %+v", len(paths), paths)
+	}
+
+	found = false
+	for _, u := range result.UnresolvedPrincipals {
+		if strings.Contains(u, "k8s:User/eks:fargate-scheduler") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected eks:fargate-scheduler to be flagged in UnresolvedPrincipals, got %+v", result.UnresolvedPrincipals)
+	}
 }

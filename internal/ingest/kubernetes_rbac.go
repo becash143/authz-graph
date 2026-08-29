@@ -133,6 +133,11 @@ func KubernetesRBAC(client *steampipe.Client) (*Result, error) {
 		}
 	}
 
+	// knownExternalPrincipals dedupes auto-vivified User/Group nodes
+	// across bindings (the same OIDC user/group is often referenced by
+	// multiple RoleBindings/ClusterRoleBindings).
+	knownExternalPrincipals := make(map[string]bool)
+
 	bind := func(bindingName, bindingNamespace string, ref k8sRoleRef, subjects []k8sSubject) {
 		roleID, ok := resolveRoleRef(bindingNamespace, ref)
 		if !ok {
@@ -141,12 +146,47 @@ func KubernetesRBAC(client *steampipe.Client) (*Result, error) {
 		for _, s := range subjects {
 			if s.Kind != "ServiceAccount" {
 				// User/Group subjects have no backing Kubernetes
-				// object to ingest a node for (they come from an
-				// external OIDC/auth provider) -- surfaced as
-				// unresolved rather than silently skipped, same
-				// reasoning as AWS cross-account trust principals.
-				result.UnresolvedPrincipals = append(result.UnresolvedPrincipals,
-					fmt.Sprintf("k8s:%s/%s (referenced by binding %s/%s)", s.Kind, s.Name, bindingNamespace, bindingName))
+				// object -- they come from an external OIDC/auth
+				// provider (or, for EKS, built-in system identities
+				// like eks:fargate-scheduler). There's nothing to
+				// "list" and confirm the way ServiceAccounts can be
+				// double-checked, but the binding itself proves the
+				// principal is real and does have access. Auto-vivify
+				// a node so `why`/`effective` can actually be queried
+				// against these -- refusing to create a node here
+				// would make it impossible to audit access for exactly
+				// the class of built-in system/OIDC identities this
+				// tool most needs to cover. Still flagged as
+				// unresolved so it's clear the node is inferred from
+				// a binding reference, not a directly-observed object.
+				var kind graph.NodeKind
+				switch s.Kind {
+				case "User":
+					kind = graph.NodeK8sUser
+				case "Group":
+					kind = graph.NodeK8sGroup
+				default:
+					// Genuinely unrecognized subject kind -- no safe
+					// node type to create, so surface it and skip
+					// rather than guess.
+					result.UnresolvedPrincipals = append(result.UnresolvedPrincipals,
+						fmt.Sprintf("k8s:%s/%s (unrecognized subject kind, referenced by binding %s/%s)", s.Kind, s.Name, bindingNamespace, bindingName))
+					continue
+				}
+				subjectID := fmt.Sprintf("k8s:%s/%s", s.Kind, s.Name)
+				if !knownExternalPrincipals[subjectID] {
+					result.Nodes = append(result.Nodes, graph.Node{
+						ID: subjectID, Kind: kind, Name: s.Name,
+						Source: "kubernetes (inferred from binding subject -- no backing k8s object; external OIDC identity or built-in system principal)",
+					})
+					knownExternalPrincipals[subjectID] = true
+					result.UnresolvedPrincipals = append(result.UnresolvedPrincipals,
+						fmt.Sprintf("%s (referenced by binding %s/%s)", subjectID, bindingNamespace, bindingName))
+				}
+				result.Edges = append(result.Edges, graph.Edge{
+					From: subjectID, To: roleID,
+					Kind: graph.EdgeBoundBy, GrantedVia: fmt.Sprintf("RoleBinding %s/%s", bindingNamespace, bindingName),
+				})
 				continue
 			}
 			subjectNamespace := s.Namespace

@@ -45,4 +45,20 @@ func TestAWSIAM_AgainstFakeSteampipe(t *testing.T) {
 	if len(paths[0].Hops) != 3 {
 		t.Fatalf("expected member_of -> can_assume -> grants (3 hops), got %d", len(paths[0].Hops))
 	}
+
+	// alice also has an inline policy (SelfManageAccessKeys) directly on
+	// her user object -- a 1-hop grant with no attached-policy ARN to
+	// join through. This must resolve even though it comes from
+	// inline_policies_std rather than attached_policy_arns +
+	// aws_iam_policy.policy_std.
+	paths, err = graph.WhyAccess(g, "aws:iam:user/alice", "iam:CreateAccessKey", "arn:aws:iam::111111111111:user/alice")
+	if err != nil {
+		t.Fatalf("WhyAccess for inline policy grant: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path for alice's inline-policy grant, got %d: %+v", len(paths), paths)
+	}
+	if len(paths[0].Hops) != 1 {
+		t.Fatalf("expected a direct 1-hop grant for the inline policy, got %d", len(paths[0].Hops))
+	}
 }
