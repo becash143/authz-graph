@@ -101,6 +101,39 @@ func TestEffectivePrincipals(t *testing.T) {
 	}
 }
 
+func TestAllGrants(t *testing.T) {
+	g := buildTestGraph(t)
+	grants, err := AllGrants(g, "aws:iam:user/alice")
+	if err != nil {
+		t.Fatalf("AllGrants: %v", err)
+	}
+	// alice has no direct grants of her own -- both come from the
+	// effective principal set: engineers' S3ReadOnly and deploy-role's
+	// DeployPolicy.
+	if len(grants) != 2 {
+		t.Fatalf("expected 2 grants (from engineers and deploy-role), got %d: %+v", len(grants), grants)
+	}
+
+	byHolder := map[string]Grant{}
+	for _, gr := range grants {
+		byHolder[gr.HeldBy.ID] = gr
+	}
+	if gr, ok := byHolder["aws:iam:group/engineers"]; !ok || gr.Edge.Action != "s3:GetObject" {
+		t.Errorf("expected a grant held by engineers for s3:GetObject, got %+v (present=%v)", gr, ok)
+	}
+	if gr, ok := byHolder["aws:iam:role/deploy-role"]; !ok || gr.Edge.Action != "cloudformation:*" {
+		t.Errorf("expected a grant held by deploy-role for cloudformation:*, got %+v (present=%v)", gr, ok)
+	}
+}
+
+func TestAllGrants_UnknownPrincipal(t *testing.T) {
+	g := buildTestGraph(t)
+	_, err := AllGrants(g, "aws:iam:user/does-not-exist")
+	if err == nil {
+		t.Fatal("expected an error for an unknown principal, got nil")
+	}
+}
+
 func TestMatchPattern(t *testing.T) {
 	cases := []struct {
 		pattern, value string

@@ -46,6 +46,8 @@ func main() {
 		cmdWhy(os.Args[2:])
 	case "effective":
 		cmdEffective(os.Args[2:])
+	case "grants":
+		cmdGrants(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
 	case "serve":
@@ -70,6 +72,7 @@ Commands:
   why          [--graph FILE] --principal ID --action ACTION --resource RESOURCE
                                                          Explain every path by which principal can perform action on resource
   effective    [--graph FILE] --principal ID            List every principal/role reachable from ID via membership/assume/binding
+  grants       [--graph FILE] --principal ID            List every actual permission (action+resource) reachable from ID -- use this BEFORE 'why' when you don't yet know which specific action/resource to ask about
   list         [--graph FILE] [--kind KIND]             List every node in the graph, optionally filtered by kind
   serve        [--graph FILE] [--addr ADDR]              Serve a web UI + JSON API over the graph file (default :8080)
   version                                                Print the authz-graph version
@@ -201,6 +204,35 @@ func cmdEffective(args []string) {
 	fmt.Printf("%s's effective principal set (%d, via membership/assume/binding):\n", *principal, len(nodes))
 	for _, n := range nodes {
 		fmt.Printf("  - %s (%s)\n", n.ID, n.Kind)
+	}
+}
+
+func cmdGrants(args []string) {
+	fs := flag.NewFlagSet("grants", flag.ExitOnError)
+	graphPath := fs.String("graph", defaultGraphPath, "graph file to read")
+	principal := fs.String("principal", "", "principal node ID")
+	fs.Parse(args)
+
+	if *principal == "" {
+		fatalf("--principal is required")
+	}
+
+	g := openOrNewGraph(*graphPath)
+	grants, err := graph.AllGrants(g, *principal)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if len(grants) == 0 {
+		fmt.Printf("No grants found for %s (or anything it can reach via membership/assume/binding).\n", *principal)
+		return
+	}
+	fmt.Printf("%d grant(s) reachable from %s:\n\n", len(grants), *principal)
+	for _, gr := range grants {
+		holder := ""
+		if gr.HeldBy.ID != *principal {
+			holder = fmt.Sprintf(" (via %s, %s)", gr.HeldBy.ID, gr.HeldBy.Kind)
+		}
+		fmt.Printf("  %s: %s on %q%s\n    via %s\n", gr.Edge.Effect, gr.Edge.Action, gr.Edge.Resource, holder, gr.Edge.GrantedVia)
 	}
 }
 

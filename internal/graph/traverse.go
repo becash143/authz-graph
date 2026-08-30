@@ -111,3 +111,46 @@ func EffectivePrincipals(g *Graph, startID string) ([]Node, error) {
 	}
 	return out, nil
 }
+
+// Grant is one direct permission reachable from a starting principal --
+// AllGrants' unit of output, pairing the actual grants Edge with which
+// node in the effective principal set is the one holding it (not
+// necessarily startID itself -- usually a group/role reached via
+// membership).
+type Grant struct {
+	HeldBy Node
+	Edge   Edge
+}
+
+// AllGrants answers a different question than WhyAccess: not "can this
+// principal do X to Y" (which requires already knowing what to ask
+// about), but "what can this principal do at all" -- every grants edge
+// reachable from startID's effective principal set (EffectivePrincipals
+// above), deduplicated. This is what the CLI's `grants` command and the
+// product plan's "why does this access exist" work backward from in
+// practice: you usually don't already know the specific action/resource
+// pair to ask WhyAccess about until you've first seen the full list
+// here.
+func AllGrants(g *Graph, startID string) ([]Grant, error) {
+	principals, err := EffectivePrincipals(g, startID)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []Grant
+	seen := make(map[string]bool) // dedupe identical (holder, action, resource, effect, grantedVia) tuples -- the same grant can be reached via more than one membership path, same reasoning as WhyAccess returning multiple paths, but here we only want the grant listed once per holder
+	for _, p := range principals {
+		for _, edge := range g.OutEdges(p.ID) {
+			if edge.Kind != EdgeGrants {
+				continue
+			}
+			key := p.ID + "|" + edge.Action + "|" + edge.Resource + "|" + edge.Effect + "|" + edge.GrantedVia
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, Grant{HeldBy: p, Edge: edge})
+		}
+	}
+	return out, nil
+}

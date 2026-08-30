@@ -17,16 +17,22 @@
       <section>
         <h2>Why does this access exist?</h2>
         <label>Principal
-          <input id="principal-input" list="principal-list" placeholder="e.g. aws:iam:user/alice or k8s:sa:prod/web-app" autocomplete="off">
-          <datalist id="principal-list"></datalist>
+          <div class="combobox">
+            <input id="principal-input" placeholder="e.g. aws:iam:user/alice or k8s:sa:prod/web-app" autocomplete="off">
+            <div id="principal-menu" class="combobox-menu" hidden></div>
+          </div>
         </label>
         <label>Action
-          <input id="action-input" list="action-list" placeholder="e.g. s3:GetObject or get">
-          <datalist id="action-list"></datalist>
+          <div class="combobox">
+            <input id="action-input" placeholder="e.g. s3:GetObject or get" autocomplete="off">
+            <div id="action-menu" class="combobox-menu" hidden></div>
+          </div>
         </label>
         <label>Resource
-          <input id="resource-input" list="resource-list" placeholder="e.g. an ARN or k8s resource name">
-          <datalist id="resource-list"></datalist>
+          <div class="combobox">
+            <input id="resource-input" placeholder="e.g. an ARN or k8s resource name" autocomplete="off">
+            <div id="resource-menu" class="combobox-menu" hidden></div>
+          </div>
         </label>
         <button id="why-btn">Why</button>
       </section>
@@ -34,9 +40,23 @@
       <section>
         <h2>Effective principal set</h2>
         <label>Principal
-          <input id="effective-principal-input" list="principal-list" placeholder="principal ID" autocomplete="off">
+          <div class="combobox">
+            <input id="effective-principal-input" placeholder="principal ID" autocomplete="off">
+            <div id="effective-principal-menu" class="combobox-menu" hidden></div>
+          </div>
         </label>
         <button id="effective-btn">Show effective set</button>
+      </section>
+
+      <section>
+        <h2>What can this principal do?</h2>
+        <label>Principal
+          <div class="combobox">
+            <input id="grants-principal-input" placeholder="principal ID" autocomplete="off">
+            <div id="grants-principal-menu" class="combobox-menu" hidden></div>
+          </div>
+        </label>
+        <button id="grants-btn">List all grants</button>
       </section>
 
       <section>

@@ -57,6 +57,48 @@ button:hover { background: var(--navy); }
 button.secondary { background: white; color: var(--accent); border: 1px solid var(--accent); }
 button.secondary:hover { background: var(--bg); }
 
+/* Custom combobox dropdown -- replaces native <input list>+<datalist>.
+   Native datalist only shows options that PREFIX-match the field's
+   current value, so once a field already has text in it (that isn't a
+   prefix of anything), the dropdown has nothing to show at all until
+   the field is cleared -- unusable once Action/Resource lists run into
+   the hundreds, which real AWS accounts routinely do. This dropdown
+   always shows every current substring match regardless of what's
+   already typed. */
+.combobox { position: relative; }
+.combobox-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 240px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.12);
+}
+.combobox-menu[hidden] { display: none; }
+.combobox-option {
+  padding: 6px 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combobox-option:hover,
+.combobox-option.active { background: var(--bg); }
+.combobox-empty,
+.combobox-hint {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
+}
+
 main { flex: 1; position: relative; display: flex; flex-direction: column; }
 #graph-toolbar {
   display: flex;

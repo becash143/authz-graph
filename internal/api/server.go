@@ -49,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/resources", s.handleResources)
 	mux.HandleFunc("/api/why", s.handleWhy)
 	mux.HandleFunc("/api/effective", s.handleEffective)
+	mux.HandleFunc("/api/grants", s.handleGrants)
 
 	return mux
 }
@@ -156,4 +157,18 @@ func (s *Server) handleEffective(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": nodes})
+}
+
+func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request) {
+	principal := r.URL.Query().Get("principal")
+	if principal == "" {
+		writeError(w, http.StatusBadRequest, "principal query parameter is required")
+		return
+	}
+	grants, err := graph.AllGrants(s.Graph, principal)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"grants": grants})
 }
