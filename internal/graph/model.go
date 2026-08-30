@@ -31,7 +31,13 @@ type Node struct {
 	Kind      NodeKind
 	Name      string
 	Namespace string // Kubernetes only
-	Source    string // "aws" or "kubernetes" -- which ingester produced this node
+	Source    string // "aws" or "kubernetes" -- which ingester produced this node; used by RemoveNodesBySource for idempotent re-ingestion, so keep this a clean, stable value, not a descriptive sentence
+	// Provenance is an optional human-readable caveat about how this
+	// node was discovered, separate from Source so Source stays
+	// reliable for exact-match filtering: e.g. "inferred from a
+	// RoleBinding subject -- no backing object was directly observed."
+	// Empty for directly-observed nodes (the normal case).
+	Provenance string
 }
 
 type EdgeKind string
@@ -115,4 +121,81 @@ func (g *Graph) AllEdges() []Edge {
 		all = append(all, edges...)
 	}
 	return all
+}
+
+// RemoveNodesBySource deletes every node with an exact Source match,
+// plus every edge touching any of those nodes (as either From or To),
+// and returns (nodes removed, edges removed).
+//
+// This exists so ingestion can be idempotent: re-running `ingest-aws`
+// or `ingest-k8s` reflects the CURRENT state of that system, rather
+// than accumulating a duplicate copy of every node/edge on every run.
+// Before this existed, running ingest-k8s twice against the same graph
+// file (a completely normal thing to do while iterating, or on a
+// schedule) silently doubled every edge -- confirmed against a real
+// run: the same RoleBinding->ClusterRole->grants chain came back 2-4x
+// in a `why` result. Called by cmd/authz-graph's ingest commands
+// before merging a fresh Result in, not left as something the caller
+// has to remember to do.
+func (g *Graph) RemoveNodesBySource(source string) (nodesRemoved, edgesRemoved int) {
+	toRemove := make(map[string]bool)
+	for id, n := range g.Nodes {
+		if n.Source == source {
+			toRemove[id] = true
+			delete(g.Nodes, id)
+			nodesRemoved++
+		}
+	}
+	if nodesRemoved == 0 {
+		return 0, 0
+	}
+
+	keep := func(e Edge) bool { return !toRemove[e.From] && !toRemove[e.To] }
+
+	// Count removed edges once, from outEdges only -- every edge is
+	// stored in both outEdges (keyed by From) and inEdges (keyed by
+	// To), so counting from both would double-count the same edge.
+	for _, edges := range g.outEdges {
+		for _, e := range edges {
+			if !keep(e) {
+				edgesRemoved++
+			}
+		}
+	}
+
+	for id, edges := range g.outEdges {
+		filtered := edges[:0]
+		for _, e := range edges {
+			if keep(e) {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(g.outEdges, id)
+		} else {
+			g.outEdges[id] = filtered
+		}
+	}
+	for id, edges := range g.inEdges {
+		filtered := edges[:0]
+		for _, e := range edges {
+			if keep(e) {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(g.inEdges, id)
+		} else {
+			g.inEdges[id] = filtered
+		}
+	}
+
+	// Drop any remaining out/in edge-list entries keyed directly by a
+	// removed node ID (a removed node's own adjacency-list entry).
+	for id := range toRemove {
+		delete(g.outEdges, id)
+		delete(g.inEdges, id)
+	}
+
+	return nodesRemoved, edgesRemoved
 }

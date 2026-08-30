@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>authz-graph</title>
+<link rel="stylesheet" href="/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>authz-graph</h1>
+    <span id="node-count" class="muted"></span>
+  </header>
+
+  <div id="layout">
+    <aside id="sidebar">
+      <section>
+        <h2>Why does this access exist?</h2>
+        <label>Principal
+          <input id="principal-input" list="principal-list" placeholder="e.g. aws:iam:user/alice or k8s:sa:prod/web-app" autocomplete="off">
+          <datalist id="principal-list"></datalist>
+        </label>
+        <label>Action
+          <input id="action-input" list="action-list" placeholder="e.g. s3:GetObject or get">
+          <datalist id="action-list"></datalist>
+        </label>
+        <label>Resource
+          <input id="resource-input" list="resource-list" placeholder="e.g. an ARN or k8s resource name">
+          <datalist id="resource-list"></datalist>
+        </label>
+        <button id="why-btn">Why</button>
+      </section>
+
+      <section>
+        <h2>Effective principal set</h2>
+        <label>Principal
+          <input id="effective-principal-input" list="principal-list" placeholder="principal ID" autocomplete="off">
+        </label>
+        <button id="effective-btn">Show effective set</button>
+      </section>
+
+      <section>
+        <button id="full-graph-btn" class="secondary">Show full graph</button>
+      </section>
+
+      <section id="legend">
+        <h2>Legend</h2>
+        <div class="legend-item"><span class="dot aws_iam_user"></span>AWS IAM user</div>
+        <div class="legend-item"><span class="dot aws_iam_group"></span>AWS IAM group</div>
+        <div class="legend-item"><span class="dot aws_iam_role"></span>AWS IAM role</div>
+        <div class="legend-item"><span class="dot k8s_service_account"></span>K8s ServiceAccount</div>
+        <div class="legend-item"><span class="dot k8s_role"></span>K8s Role</div>
+        <div class="legend-item"><span class="dot k8s_cluster_role"></span>K8s ClusterRole</div>
+        <div class="legend-item"><span class="dot k8s_user"></span>K8s User (inferred)</div>
+        <div class="legend-item"><span class="dot k8s_group"></span>K8s Group (inferred)</div>
+        <div class="legend-item"><span class="dot resource"></span>Resource (grant target)</div>
+      </section>
+
+      <section id="results"></section>
+    </aside>
+
+    <main>
+      <div id="graph-toolbar">
+        <input id="node-filter-input" placeholder="Type to filter node IDs..." autocomplete="off">
+        <span id="filter-count" class="muted"></span>
+      </div>
+      <div id="cy"></div>
+    </main>
+  </div>
+
+<script src="/app.js"></script>
+</body>
+</html>

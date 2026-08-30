@@ -177,7 +177,8 @@ func KubernetesRBAC(client *steampipe.Client) (*Result, error) {
 				if !knownExternalPrincipals[subjectID] {
 					result.Nodes = append(result.Nodes, graph.Node{
 						ID: subjectID, Kind: kind, Name: s.Name,
-						Source: "kubernetes (inferred from binding subject -- no backing k8s object; external OIDC identity or built-in system principal)",
+						Source:     "kubernetes",
+						Provenance: "inferred from a RoleBinding/ClusterRoleBinding subject -- no backing k8s object; external OIDC identity or built-in system principal",
 					})
 					knownExternalPrincipals[subjectID] = true
 					result.UnresolvedPrincipals = append(result.UnresolvedPrincipals,
@@ -212,7 +213,8 @@ func KubernetesRBAC(client *steampipe.Client) (*Result, error) {
 				result.Nodes = append(result.Nodes, graph.Node{
 					ID: subjectID, Kind: graph.NodeK8sServiceAccount,
 					Name: s.Name, Namespace: subjectNamespace,
-					Source: "kubernetes (inferred from binding subject -- not returned by kubernetes_service_account; verify it still exists and check the ingest credential's list access to this namespace)",
+					Source:     "kubernetes",
+					Provenance: "inferred from a RoleBinding/ClusterRoleBinding subject -- not returned by kubernetes_service_account; verify it still exists and check the ingest credential's list access to this namespace",
 				})
 				knownSAs[subjectID] = true
 				result.UnresolvedPrincipals = append(result.UnresolvedPrincipals,

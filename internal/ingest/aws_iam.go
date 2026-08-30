@@ -32,39 +32,18 @@ type awsIAMUserRef struct {
 	UserName string `json:"UserName"`
 }
 
-// awsInlinePolicy mirrors the real Steampipe shape for inline
-// policies: there is no separate "aws_iam_user_policy"/
-// "aws_iam_group_policy"/"aws_iam_role_policy" table in the plugin at
-// all (an earlier version of this comment assumed there was --
-// confirmed wrong by checking the plugin's actual table list).
-// Instead, aws_iam_user/aws_iam_group/aws_iam_role each carry their
-// own inline_policies_std JSONB column directly: a list of
-// {PolicyName, PolicyDocument: {Statement: [...]}}, with
-// PolicyDocument.Statement in the same normalized form as
-// aws_iam_policy.policy_std's Statement (Action/Resource always
-// arrays). Confirmed against the plugin's documented column list for
-// aws_iam_user.
-type awsInlinePolicy struct {
-	PolicyName     string `json:"PolicyName"`
-	PolicyDocument struct {
-		Statement []awsIAMPolicyStatement `json:"Statement"`
-	} `json:"PolicyDocument"`
-}
-
 type awsIAMUserRow struct {
-	Name               string            `json:"name"`
-	ARN                string            `json:"arn"`
-	AttachedPolicyARNs []string          `json:"attached_policy_arns"`
-	Groups             []awsIAMGroupRef  `json:"groups"`
-	InlinePoliciesStd  []awsInlinePolicy `json:"inline_policies_std"`
+	Name               string           `json:"name"`
+	ARN                string           `json:"arn"`
+	AttachedPolicyARNs []string         `json:"attached_policy_arns"`
+	Groups             []awsIAMGroupRef `json:"groups"`
 }
 
 type awsIAMGroupRow struct {
-	Name               string            `json:"name"`
-	ARN                string            `json:"arn"`
-	AttachedPolicyARNs []string          `json:"attached_policy_arns"`
-	Users              []awsIAMUserRef   `json:"users"`
-	InlinePoliciesStd  []awsInlinePolicy `json:"inline_policies_std"`
+	Name               string          `json:"name"`
+	ARN                string          `json:"arn"`
+	AttachedPolicyARNs []string        `json:"attached_policy_arns"`
+	Users              []awsIAMUserRef `json:"users"`
 }
 
 type assumeRolePolicyStatement struct {
@@ -76,10 +55,9 @@ type assumeRolePolicyStatement struct {
 }
 
 type awsIAMRoleRow struct {
-	Name                string            `json:"name"`
-	ARN                 string            `json:"arn"`
-	AttachedPolicyARNs  []string          `json:"attached_policy_arns"`
-	InlinePoliciesStd   []awsInlinePolicy `json:"inline_policies_std"`
+	Name                string   `json:"name"`
+	ARN                 string   `json:"arn"`
+	AttachedPolicyARNs  []string `json:"attached_policy_arns"`
 	AssumeRolePolicyStd struct {
 		Statement []assumeRolePolicyStatement `json:"Statement"`
 	} `json:"assume_role_policy_std"`
@@ -131,15 +109,15 @@ func AWSIAM(client *steampipe.Client) (*Result, error) {
 	result := &Result{}
 
 	var users []awsIAMUserRow
-	if err := client.Query("select name, arn, attached_policy_arns, groups, inline_policies_std from aws_iam_user", &users); err != nil {
+	if err := client.Query("select name, arn, attached_policy_arns, groups from aws_iam_user", &users); err != nil {
 		return nil, fmt.Errorf("querying aws_iam_user: %w", err)
 	}
 	var groups []awsIAMGroupRow
-	if err := client.Query("select name, arn, attached_policy_arns, users, inline_policies_std from aws_iam_group", &groups); err != nil {
+	if err := client.Query("select name, arn, attached_policy_arns, users from aws_iam_group", &groups); err != nil {
 		return nil, fmt.Errorf("querying aws_iam_group: %w", err)
 	}
 	var roles []awsIAMRoleRow
-	if err := client.Query("select name, arn, attached_policy_arns, inline_policies_std, assume_role_policy_std from aws_iam_role", &roles); err != nil {
+	if err := client.Query("select name, arn, attached_policy_arns, assume_role_policy_std from aws_iam_role", &roles); err != nil {
 		return nil, fmt.Errorf("querying aws_iam_role: %w", err)
 	}
 	var policies []awsIAMPolicyRow
@@ -251,7 +229,10 @@ func AWSIAM(client *steampipe.Client) (*Result, error) {
 
 	for _, stmt := range statements {
 		principals := policyToPrincipals[stmt.PolicyARN]
-		conditionStr := conditionToString(stmt.Condition)
+		conditionStr := ""
+		if stmt.Condition != nil {
+			conditionStr = fmt.Sprintf("%v", stmt.Condition)
+		}
 		for _, principalID := range principals {
 			for _, action := range stmt.Action {
 				for _, resource := range stmt.Resource {
@@ -265,49 +246,7 @@ func AWSIAM(client *steampipe.Client) (*Result, error) {
 		}
 	}
 
-	// inline policies -> grants edges, directly from the owning
-	// principal (unlike attached/managed policies, an inline policy
-	// document lives embedded on the user/group/role itself -- there's
-	// no separate policy ARN to join through).
-	grantsFromInline := func(principalID string, policies []awsInlinePolicy) {
-		for _, p := range policies {
-			for _, stmt := range p.PolicyDocument.Statement {
-				conditionStr := conditionToString(stmt.Condition)
-				for _, action := range stmt.Action {
-					for _, resource := range stmt.Resource {
-						result.Edges = append(result.Edges, graph.Edge{
-							From: principalID, Kind: graph.EdgeGrants,
-							Action: action, Resource: resource, Effect: stmt.Effect,
-							Condition:  conditionStr,
-							GrantedVia: fmt.Sprintf("inline policy %q on %s", p.PolicyName, principalID),
-						})
-					}
-				}
-			}
-		}
-	}
-	for _, u := range users {
-		grantsFromInline(userNodeID(u.Name), u.InlinePoliciesStd)
-	}
-	for _, g := range groups {
-		grantsFromInline(groupNodeID(g.Name), g.InlinePoliciesStd)
-	}
-	for _, r := range roles {
-		grantsFromInline(roleNodeID(r.Name), r.InlinePoliciesStd)
-	}
-
 	return result, nil
-}
-
-// conditionToString renders a policy statement's Condition block (raw
-// interface{} decoded from JSONB -- shape is {operator: {key:
-// [values]}} per Steampipe's normalized form) to a display string,
-// shared between the attached-policy and inline-policy grant paths.
-func conditionToString(condition interface{}) string {
-	if condition == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", condition)
 }
 
 func lastIndex(s, substr string) int {

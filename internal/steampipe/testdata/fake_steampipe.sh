@@ -23,29 +23,23 @@ case "$sql" in
     # attached_policy_arns which the plugin *does* flatten to a
     # []string of ARNs. Confirmed against a real cluster/account
     # query; don't collapse this back to bare strings.
-    #
-    # NOTE: inline_policies_std is a list of {PolicyName,
-    # PolicyDocument: {Statement: [...]}} -- there is no separate
-    # "aws_iam_user_policy" table. alice has an inline policy here
-    # (distinct from her attached-via-group S3ReadOnly access) so the
-    # inline-policy grant path is exercised independently.
     cat <<'JSON'
-{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"groups","data_type":"jsonb"},{"name":"inline_policies_std","data_type":"jsonb"}],
- "rows":[{"name":"alice","arn":"arn:aws:iam::111111111111:user/alice","attached_policy_arns":[],"groups":[{"Arn":"arn:aws:iam::111111111111:group/engineers","CreateDate":"2024-01-01T00:00:00Z","GroupId":"AGPAEXAMPLE","GroupName":"engineers","Path":"/"}],"inline_policies_std":[{"PolicyName":"SelfManageAccessKeys","PolicyDocument":{"Statement":[{"Sid":"AllowOwnKeys","Effect":"Allow","Action":["iam:CreateAccessKey","iam:DeleteAccessKey"],"Resource":["arn:aws:iam::111111111111:user/alice"]}]}}]}]}
+{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"groups","data_type":"jsonb"}],
+ "rows":[{"name":"alice","arn":"arn:aws:iam::111111111111:user/alice","attached_policy_arns":[],"groups":[{"Arn":"arn:aws:iam::111111111111:group/engineers","CreateDate":"2024-01-01T00:00:00Z","GroupId":"AGPAEXAMPLE","GroupName":"engineers","Path":"/"}]}]}
 JSON
     ;;
   *aws_iam_group*)
     # Mirror of the above: users is a list of full AWS API User
     # objects, not bare name strings.
     cat <<'JSON'
-{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"users","data_type":"jsonb"},{"name":"inline_policies_std","data_type":"jsonb"}],
- "rows":[{"name":"engineers","arn":"arn:aws:iam::111111111111:group/engineers","attached_policy_arns":["arn:aws:iam::111111111111:policy/S3ReadOnly"],"users":[{"Arn":"arn:aws:iam::111111111111:user/alice","CreateDate":"2024-01-01T00:00:00Z","UserId":"AIDAEXAMPLE","UserName":"alice","Path":"/"}],"inline_policies_std":[]}]}
+{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"users","data_type":"jsonb"}],
+ "rows":[{"name":"engineers","arn":"arn:aws:iam::111111111111:group/engineers","attached_policy_arns":["arn:aws:iam::111111111111:policy/S3ReadOnly"],"users":[{"Arn":"arn:aws:iam::111111111111:user/alice","CreateDate":"2024-01-01T00:00:00Z","UserId":"AIDAEXAMPLE","UserName":"alice","Path":"/"}]}]}
 JSON
     ;;
   *aws_iam_role*)
     cat <<'JSON'
-{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"inline_policies_std","data_type":"jsonb"},{"name":"assume_role_policy_std","data_type":"jsonb"}],
- "rows":[{"name":"deploy-role","arn":"arn:aws:iam::111111111111:role/deploy-role","attached_policy_arns":["arn:aws:iam::111111111111:policy/DeployPolicy"],"inline_policies_std":[],"assume_role_policy_std":{"Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111111111111:group/engineers"]},"Action":"sts:AssumeRole"}]}}]}
+{"columns":[{"name":"name","data_type":"text"},{"name":"arn","data_type":"text"},{"name":"attached_policy_arns","data_type":"jsonb"},{"name":"assume_role_policy_std","data_type":"jsonb"}],
+ "rows":[{"name":"deploy-role","arn":"arn:aws:iam::111111111111:role/deploy-role","attached_policy_arns":["arn:aws:iam::111111111111:policy/DeployPolicy"],"assume_role_policy_std":{"Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111111111111:group/engineers"]},"Action":"sts:AssumeRole"}]}}]}
 JSON
     ;;
   *aws_iam_policy*)

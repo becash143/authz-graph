@@ -10,10 +10,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
-	"sort"
-	"strings"
 
+	"github.com/becash143/authz-graph/internal/api"
 	"github.com/becash143/authz-graph/internal/graph"
 	"github.com/becash143/authz-graph/internal/ingest"
 	"github.com/becash143/authz-graph/internal/steampipe"
@@ -43,12 +44,12 @@ func main() {
 		cmdIngestK8s(os.Args[2:])
 	case "why":
 		cmdWhy(os.Args[2:])
-	case "grants":
-		cmdGrants(os.Args[2:])
 	case "effective":
 		cmdEffective(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
+	case "serve":
+		cmdServe(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("authz-graph " + version)
 	case "-h", "--help", "help":
@@ -68,11 +69,9 @@ Commands:
   ingest-k8s   [--graph FILE] [--steampipe-bin PATH]   Ingest Kubernetes RBAC via steampipe, merge into the graph file
   why          [--graph FILE] --principal ID --action ACTION --resource RESOURCE
                                                          Explain every path by which principal can perform action on resource
-  grants       [--graph FILE] --principal ID [--full]   List everything principal can do, deduped to one line per distinct
-                                                         (effect, action, resource, granted-via) -- pass --full for every
-                                                         individual path (same traversal as 'why' with wildcards, undeduped)
   effective    [--graph FILE] --principal ID            List every principal/role reachable from ID via membership/assume/binding
   list         [--graph FILE] [--kind KIND]             List every node in the graph, optionally filtered by kind
+  serve        [--graph FILE] [--addr ADDR]              Serve a web UI + JSON API over the graph file (default :8080)
   version                                                Print the authz-graph version
 
 Run 'ingest-aws' and/or 'ingest-k8s' first (against a steampipe install with the AWS and/or
@@ -104,6 +103,7 @@ func cmdIngestAWS(args []string) {
 	}
 
 	g := openOrNewGraph(*graphPath)
+	nodesPurged, edgesPurged := g.RemoveNodesBySource("aws")
 	if err := result.MergeInto(g); err != nil {
 		fatalf("merging AWS IAM data into graph: %v", err)
 	}
@@ -111,6 +111,9 @@ func cmdIngestAWS(args []string) {
 		fatalf("saving graph file: %v", err)
 	}
 
+	if nodesPurged > 0 {
+		fmt.Printf("Replaced previous AWS data: %d stale node(s) and %d stale edge(s) removed before merging the fresh ingest.\n", nodesPurged, edgesPurged)
+	}
 	fmt.Printf("Ingested AWS IAM: %d nodes, %d edges added. Graph saved to %s.\n", len(result.Nodes), len(result.Edges), *graphPath)
 	if len(result.UnresolvedPrincipals) > 0 {
 		fmt.Printf("\n%d principal(s) referenced in trust policies could not be resolved to a graph node (cross-account ARNs are out of scope for this MVP -- see internal/ingest/aws_iam.go):\n", len(result.UnresolvedPrincipals))
@@ -133,6 +136,7 @@ func cmdIngestK8s(args []string) {
 	}
 
 	g := openOrNewGraph(*graphPath)
+	nodesPurged, edgesPurged := g.RemoveNodesBySource("kubernetes")
 	if err := result.MergeInto(g); err != nil {
 		fatalf("merging Kubernetes RBAC data into graph: %v", err)
 	}
@@ -140,6 +144,9 @@ func cmdIngestK8s(args []string) {
 		fatalf("saving graph file: %v", err)
 	}
 
+	if nodesPurged > 0 {
+		fmt.Printf("Replaced previous Kubernetes data: %d stale node(s) and %d stale edge(s) removed before merging the fresh ingest.\n", nodesPurged, edgesPurged)
+	}
 	fmt.Printf("Ingested Kubernetes RBAC: %d nodes, %d edges added. Graph saved to %s.\n", len(result.Nodes), len(result.Edges), *graphPath)
 	if len(result.UnresolvedPrincipals) > 0 {
 		fmt.Printf("\n%d principal(s) added to the graph as inferred/unverified (queryable via `why`/`effective`, but not directly confirmed against a live object -- see internal/ingest/kubernetes_rbac.go):\n", len(result.UnresolvedPrincipals))
@@ -164,7 +171,7 @@ func cmdWhy(args []string) {
 	g := openOrNewGraph(*graphPath)
 	paths, err := graph.WhyAccess(g, *principal, *action, *resource)
 	if err != nil {
-		fatalf("%s", unknownPrincipalHint(err))
+		fatalf("%v", err)
 	}
 	if len(paths) == 0 {
 		fmt.Printf("No path found: %s cannot perform %s on %s (as far as this graph currently knows -- re-run ingest-aws/ingest-k8s if the graph is stale).\n", *principal, *action, *resource)
@@ -173,65 +180,6 @@ func cmdWhy(args []string) {
 	fmt.Printf("%d path(s) found:\n\n", len(paths))
 	for i, p := range paths {
 		fmt.Printf("Path %d:\n%s\n\n", i+1, p.String())
-	}
-}
-
-// cmdGrants answers "what can this principal actually do" without
-// requiring the caller to already know an action/resource pair to
-// check -- reuses the same traversal as `why` with wildcards, but
-// deduped: a grant reached via two different paths (e.g. two group
-// memberships landing on the same policy statement) collapses to one
-// line by default, since for a "what can X do" summary the distinct
-// grant is what matters, not how many routes reach it. --full falls
-// back to one block per individual path (same output as
-// `why --action "*" --resource "*"`) for when the routing itself is
-// what's being audited.
-func cmdGrants(args []string) {
-	fs := flag.NewFlagSet("grants", flag.ExitOnError)
-	graphPath := fs.String("graph", defaultGraphPath, "graph file to read")
-	principal := fs.String("principal", "", "principal node ID")
-	full := fs.Bool("full", false, "show every individual path instead of a deduped summary")
-	fs.Parse(args)
-
-	if *principal == "" {
-		fatalf("--principal is required")
-	}
-
-	g := openOrNewGraph(*graphPath)
-	paths, err := graph.WhyAccess(g, *principal, "*", "*")
-	if err != nil {
-		fatalf("%s", unknownPrincipalHint(err))
-	}
-	if len(paths) == 0 {
-		fmt.Printf("No grants found for %s (as far as this graph currently knows -- re-run ingest-aws/ingest-k8s if the graph is stale).\n", *principal)
-		return
-	}
-
-	if *full {
-		fmt.Printf("%d grant path(s) found:\n\n", len(paths))
-		for i, p := range paths {
-			fmt.Printf("Path %d:\n%s\n\n", i+1, p.String())
-		}
-		return
-	}
-
-	type grantKey struct{ effect, action, resource, via string }
-	seen := make(map[grantKey]bool)
-	var lines []string
-	for _, p := range paths {
-		last := p.Hops[len(p.Hops)-1]
-		k := grantKey{last.Edge.Effect, last.Edge.Action, last.Edge.Resource, last.Edge.GrantedVia}
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		lines = append(lines, fmt.Sprintf("%s: %s on %s  (via %s)", last.Edge.Effect, last.Edge.Action, last.Edge.Resource, last.Edge.GrantedVia))
-	}
-	sort.Strings(lines)
-
-	fmt.Printf("%s can do %d distinct thing(s) (%d total path(s) found -- some reached more than one way; pass --full to see every path):\n\n", *principal, len(lines), len(paths))
-	for _, l := range lines {
-		fmt.Println(l)
 	}
 }
 
@@ -248,7 +196,7 @@ func cmdEffective(args []string) {
 	g := openOrNewGraph(*graphPath)
 	nodes, err := graph.EffectivePrincipals(g, *principal)
 	if err != nil {
-		fatalf("%s", unknownPrincipalHint(err))
+		fatalf("%v", err)
 	}
 	fmt.Printf("%s's effective principal set (%d, via membership/assume/binding):\n", *principal, len(nodes))
 	for _, n := range nodes {
@@ -274,27 +222,24 @@ func cmdList(args []string) {
 	fmt.Fprintf(os.Stderr, "\n%d node(s)\n", count)
 }
 
+func cmdServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	graphPath := fs.String("graph", defaultGraphPath, "graph file to serve")
+	addr := fs.String("addr", ":8080", "address to listen on")
+	fs.Parse(args)
+
+	g, err := store.Load(*graphPath)
+	if err != nil {
+		fatalf("loading graph file %s: %v (run ingest-aws/ingest-k8s first)", *graphPath, err)
+	}
+
+	srv := &api.Server{Graph: g}
+	fmt.Printf("Serving %d node(s), %d edge(s) from %s on http://localhost%s\n", len(g.Nodes), len(g.AllEdges()), *graphPath, *addr)
+	fmt.Println("Note: this loads the graph once at startup -- re-run ingest-aws/ingest-k8s then restart `serve` to pick up fresh data, there is no live-reload yet.")
+	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+}
+
 func fatalf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	os.Exit(1)
-}
-
-// unknownPrincipalHint appends actionable guidance to a graph
-// "unknown principal" error rather than surfacing it bare: the two
-// realistic causes are (1) the graph file predates a change to what
-// gets ingested as a node -- e.g. Kubernetes User/Group binding
-// subjects only started being auto-vivified in a later version of
-// this tool, so a graph ingested before that change won't have nodes
-// for them even though the underlying binding is real -- or (2) the
-// principal genuinely was never referenced by any binding/policy this
-// tool ingested, which is itself a legitimate (and often reassuring)
-// finding. Re-ingesting resolves (1); if the error persists after
-// that, it's (2).
-func unknownPrincipalHint(err error) string {
-	if !strings.Contains(err.Error(), "unknown principal") {
-		return err.Error()
-	}
-	return fmt.Sprintf("%v -- this node isn't in the graph. Try re-running ingest-aws/ingest-k8s "+
-		"(older graph files may predate node types this tool now creates), then retry. If it's still "+
-		"unknown after a fresh ingest, nothing this tool ingested actually references this principal.", err)
 }

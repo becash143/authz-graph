@@ -27,23 +27,6 @@ aws:iam:user/alice (aws_iam_user)
   --[grants: Allow]--> cloudformation:* on * (via arn:aws:iam::111111111111:policy/DeployPolicy)
 ```
 
-## Commands
-
-| Command | What it answers |
-|---|---|
-| `ingest-aws` / `ingest-k8s` | Pull AWS IAM / Kubernetes RBAC via steampipe, merge into the graph file |
-| `why --principal --action --resource` | Every path by which a principal can do a specific thing |
-| `grants --principal [--full]` | Everything a principal can do, deduped to one line per distinct grant (pass `--full` for every individual path, same output as `why` with wildcards) |
-| `effective --principal` | Every identity reachable from a principal via membership/assume/binding — **not** what those identities can do, just what they *are* |
-| `list [--kind]` | Every node in the graph, optionally filtered by kind |
-
-`effective` and `grants` answer different questions and are easy to
-conflate: `effective` walks identity edges only (who/what this
-principal *is*, transitively), `grants`/`why` walk into the actual
-permission edges (what it can *do*). Use `effective` to see the blast
-radius of group/role membership itself; use `grants` to see the
-resulting permissions.
-
 ## Install
 
 ```
@@ -84,77 +67,105 @@ go build -o authz-graph ./cmd/authz-graph
   graph database, without touching `internal/graph`'s traversal logic
   at all.
 
-## Status: early / Phase 0
+## Status: tested against a real EKS cluster, still early
 
-This is a working prototype, not a hardened product. Here's an honest
-breakdown of what's solid and what isn't yet.
+This has now been run against a real cluster (not just the fake
+fixtures below) and one real, load-bearing bug was found and fixed as
+a direct result -- documented here rather than glossed over:
 
-**Validated against real environments** (not just the fake-Steampipe
-fixtures below):
-- **AWS IAM ingestion and traversal** — tested against a real
-  multi-role AWS account (dozens of IAM roles, service-linked roles,
-  and users/groups). This surfaced and fixed real Steampipe-shape
-  bugs along the way: `aws_iam_user.groups`/`aws_iam_group.users`
-  return full AWS API objects, not bare name strings; there is no
-  `aws_iam_policy_statement` table at all — statements come from
-  `aws_iam_policy.policy_std`, flattened client-side; and there are
-  no `aws_iam_user_policy`/`aws_iam_group_policy`/
-  `aws_iam_role_policy` tables either — inline policies are a
-  JSONB `inline_policies_std` column directly on `aws_iam_user`/
-  `aws_iam_group`/`aws_iam_role` themselves (`[{PolicyName,
-  PolicyDocument: {Statement: [...]}}]`), also flattened client-side.
-  All three are handled in `internal/ingest/aws_iam.go`, so `why`/
-  `effective` now account for both managed and inline policies.
-- **Kubernetes RBAC ingestion and traversal** — tested against a real
-  production EKS cluster (250+ nodes, 4,000+ edges from RoleBindings/
-  ClusterRoleBindings alone). This also surfaced and fixed real
-  Steampipe-shape bugs: `kubernetes_role_binding`/
-  `kubernetes_cluster_role_binding` have no `role_ref` column at all
-  (`RoleRef` is flattened into `role_name`/`role_api_group`/
-  `role_kind`); and binding subjects — both `ServiceAccount`s not
-  returned by `kubernetes_service_account` (RBAC-visibility gaps are
-  common on EKS) and `User`/`Group` subjects (built-in EKS identities
-  like `eks:fargate-scheduler`, or external OIDC principals) — are now
-  auto-vivified into queryable nodes rather than crashing the ingest
-  or silently making `why`/`effective` unable to answer for them.
-- The graph traversal engine itself (`internal/graph`) — unit-tested
-  independently of Steampipe against hand-built graphs, including
-  cycle handling for trust-policy loops.
+**Fixed after real-cluster testing:**
+- **Duplicate edges on re-ingestion.** Running `ingest-k8s` (or
+  `ingest-aws`) a second time against an existing graph file used to
+  *add* a second copy of every node/edge on top of the first, rather
+  than replacing them -- confirmed against a real cluster, where the
+  same RoleBinding->ClusterRole->grant chain came back 2-4x in a `why`
+  result. Fixed: both ingest commands now call
+  `graph.RemoveNodesBySource` to clear that source's previous data
+  before merging in a fresh ingest, making re-ingestion idempotent.
+  Covered by `internal/ingest/idempotent_test.go`, which re-ingests
+  the same fixture four times and asserts the node/edge count and a
+  `why` result never change after the first ingest.
+- **`kubernetes_role_binding`/`kubernetes_cluster_role_binding`'s real
+  schema** has no single `role_ref` column -- it's flattened into
+  `role_name`, `role_kind`, `role_api_group` as separate scalar
+  columns. Confirmed against `table_kubernetes_role_binding.go` in
+  [turbot/steampipe-plugin-kubernetes](https://github.com/turbot/steampipe-plugin-kubernetes),
+  not just a live query.
+- **AWS's `aws_iam_policy_statement` table doesn't exist.** The real
+  table is `aws_iam_policy`, whose `policy_std` column holds the
+  normalized policy document; statements are now flattened
+  client-side in `internal/ingest/aws_iam.go` instead.
+- **`aws_iam_user.groups` / `aws_iam_group.users`** are arrays of full
+  AWS API objects, not plain name strings -- fixed to decode the
+  object and pull `GroupName`/`UserName` out of it.
+- **Kubernetes `User`/`Group` RoleBinding subjects** (built-in system
+  identities like `system:kube-scheduler`, `system:masters`, or
+  external OIDC principals) are now auto-vivified into real graph
+  nodes instead of only being logged as unresolved -- these are often
+  the *most* security-relevant principals to be able to run `why`
+  against (they're how `cluster-admin` actually gets granted). Each
+  such node carries a `Provenance` note making clear it was inferred
+  from a binding reference, not directly observed as a distinct
+  object, and still gets listed in the ingest command's
+  inferred/unverified summary.
 
-**Known gaps — surfaced via `UnresolvedPrincipals`, not silently
-dropped, but genuinely out of scope for now:**
-- **AWS permission boundaries and SCPs** aren't modeled — a grant this
-  tool reports may still be blocked by an org-level SCP or a
-  permission boundary at the account.
-- **Cross-account AWS trust relationships** (a role trusting a
-  principal in a *different* AWS account, including bare `:root`
-  trust) aren't resolved to a node — the target account's IAM isn't
-  ingested, so there's nothing to link to. Landed in
-  `UnresolvedPrincipals` instead.
-- **The AWS graph and the Kubernetes graph are not yet linked.** IRSA
-  (IAM Roles for Service Accounts) means a K8s ServiceAccount can
-  assume a real AWS role via that role's trust policy, but today
-  that's two separate facts in two separate ingests — `why`/
-  `effective` won't walk a k8s ServiceAccount into AWS IAM
-  permissions in one path. Worth watching for if you're auditing a
-  workload's *total* blast radius, not just its Kubernetes RBAC.
-- **Auto-vivified K8s User/Group/ServiceAccount nodes are inferred,
-  not independently confirmed.** They're created purely from a
-  binding's `subjects` list — there's no corresponding "does this
-  identity actually still exist / authenticate successfully" check.
-  This is the safer direction to err in for a security tool (a
-  binding to a since-deleted or since-renamed identity still shows up
-  as a potential path rather than silently vanishing), but don't treat
-  every node in the graph as confirmed-live.
+**Still not fully hardened:**
+- Cross-account AWS trust relationships (a role trusting a principal
+  in a *different* AWS account) remain out of scope -- surfaced via
+  `UnresolvedPrincipals`, not silently dropped.
+- Only tested against one real EKS cluster so far. AKS/GKE/kubeadm
+  clusters may expose the Kubernetes plugin's columns slightly
+  differently -- if `ingest-k8s` errors on a column name, that's a real
+  bug report, not user error.
+- The web UI (below) is new and has been verified at the API/data
+  layer, not yet visually confirmed in a browser in this environment
+  -- see its section for exactly what was and wasn't checked.
+
+## Web UI
+
+`authz-graph serve` starts a local web UI + JSON API over an already-ingested
+graph file -- a single self-contained binary, no separate frontend
+build or deploy step (the UI is embedded into the binary via Go's
+`embed` package).
+
+```
+go build -o authz-graph ./cmd/authz-graph
+./authz-graph ingest-aws && ./authz-graph ingest-k8s   # or against the fake fixture, see below
+./authz-graph serve --addr :8080
+# open http://localhost:8080
+```
+
+It gives you: a principal search (autocomplete over everything
+ingested), a "why" query with results rendered both as text and as an
+interactive graph (powered by [Cytoscape.js](https://js.cytoscape.org/),
+loaded from a CDN -- the one external dependency in this entire
+project, and it's client-side JS in your browser, not a Go module),
+an "effective principal set" view, and a full-graph explorer.
+
+**What's verified vs. not, honestly:** the JSON API
+(`/api/graph`, `/api/principals`, `/api/why`, `/api/effective`) was
+tested directly with `curl` against a real ingested graph and returns
+the exact shape the frontend code expects -- checked by hand,
+field-for-field. What I could *not* verify in the sandbox this was
+built in: the actual rendered graph in a browser. Cytoscape.js loads
+from `cdnjs.cloudflare.com`, which that sandbox's network policy
+didn't allow reaching, so the visual rendering itself needs a real
+look before you trust it -- it's the one piece here that's "should
+work, carefully written against the verified API shape" rather than
+"confirmed working."
+
+No live-reload yet -- `serve` loads the graph file once at startup, so
+re-run `ingest-aws`/`ingest-k8s` and restart `serve` to pick up fresh
+data. Fine for the current CLI-first workflow; worth revisiting if the
+UI becomes the primary way this gets used.
 
 ## Try it (no AWS account or cluster needed)
 
 `internal/steampipe/testdata/fake_steampipe.sh` stands in for the real
 `steampipe` binary and returns fixed fixtures: `alice` → `engineers`
 group → S3 read access directly, and → assumed `deploy-role` →
-CloudFormation access, plus a direct inline-policy grant on her own
-user; a `web-app` ServiceAccount → `pod-reader` Role via a
-RoleBinding.
+CloudFormation access; a `web-app` ServiceAccount → `pod-reader` Role
+via a RoleBinding.
 
 ```
 go build -o authz-graph ./cmd/authz-graph
@@ -166,7 +177,6 @@ FAKE=internal/steampipe/testdata/fake_steampipe.sh
 ./authz-graph list
 ./authz-graph why --principal aws:iam:user/alice --action s3:GetObject --resource arn:aws:s3:::prod-data-bucket/report.csv
 ./authz-graph why --principal aws:iam:user/alice --action cloudformation:CreateStack --resource arn:aws:cloudformation:us-east-1:111111111111:stack/x
-./authz-graph grants --principal aws:iam:user/alice
 ./authz-graph effective --principal aws:iam:user/alice
 ```
 
@@ -177,35 +187,6 @@ make sure `steampipe plugin install aws` / `steampipe plugin install
 kubernetes` are configured with real connections first. Verify each
 plugin works standalone (`steampipe query "select * from aws_iam_user"`)
 before filing an issue against this tool.
-
-## Troubleshooting
-
-**"unknown principal" from `why`/`grants`/`effective`, for a principal
-you know exists.** The CLI now prints a hint for this, but the short
-version: your graph file is almost certainly stale relative to the
-binary. Re-run `ingest-aws`/`ingest-k8s` against the same `--graph`
-path and retry.
-
-**A rebuild doesn't seem to have fixed something.** If you're building
-from a separate clone/fork rather than a fresh checkout, confirm the
-fix you expect is actually in the source you're compiling before
-assuming a re-ingest will help:
-
-```
-grep -n "knownExternalPrincipals" internal/ingest/kubernetes_rbac.go
-```
-
-If that returns nothing, your local Kubernetes ingester predates the
-User/Group auto-vivify support (see Status above) — sync your copy
-before re-ingesting. This specific check is worth calling out because
-it's easy to get fooled by: the ingest CLI's `"... couldn't be fully
-resolved"` output text is **identical** whether your binary auto-
-vivifies those nodes or just drops them, since the message was written
-before the auto-vivify fix and reused verbatim after — so seeing that
-list print does not by itself confirm the fix is active. The only
-reliable check is grepping the source (above) or trying a `why`/
-`grants` query against one of the listed principals and seeing whether
-it resolves.
 
 ## Testing
 
@@ -233,9 +214,7 @@ Kubernetes.
 ## Contributing
 
 Issues and PRs welcome, especially:
-- AWS permission-boundary and SCP awareness — the largest known
-  coverage gap right now (see Status above)
-- Linking the AWS and Kubernetes graphs via IRSA trust relationships
+- Real-world Kubernetes plugin column verification (see Status above)
 - Additional escalation-path coverage in the AWS IAM ingester
 - New ingesters following the existing `Result`/`MergeInto` pattern
 
