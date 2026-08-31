@@ -8,11 +8,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/becash143/authz-graph/internal/api"
 	"github.com/becash143/authz-graph/internal/graph"
@@ -74,7 +78,8 @@ Commands:
   effective    [--graph FILE] --principal ID            List every principal/role reachable from ID via membership/assume/binding
   grants       [--graph FILE] --principal ID            List every actual permission (action+resource) reachable from ID -- use this BEFORE 'why' when you don't yet know which specific action/resource to ask about
   list         [--graph FILE] [--kind KIND]             List every node in the graph, optionally filtered by kind
-  serve        [--graph FILE] [--addr ADDR]              Serve a web UI + JSON API over the graph file (default :8080)
+  serve        [--graph FILE] [--addr ADDR] [--token T] [--allow-remote]
+                                                         Serve a web UI + JSON API over the graph file (default: loopback-only, 127.0.0.1:8080)
   version                                                Print the authz-graph version
 
 Run 'ingest-aws' and/or 'ingest-k8s' first (against a steampipe install with the AWS and/or
@@ -257,8 +262,23 @@ func cmdList(args []string) {
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	graphPath := fs.String("graph", defaultGraphPath, "graph file to serve")
-	addr := fs.String("addr", ":8080", "address to listen on")
+	addr := fs.String("addr", "127.0.0.1:8080", "address to listen on -- defaults to loopback-only (see --allow-remote before changing this)")
+	token := fs.String("token", "", "shared-secret bearer token required on /api/* requests (Authorization: Bearer <token>, or ?token=<token> for browser convenience). Required if --allow-remote is set; optional (and rarely useful) on the loopback-only default.")
+	allowRemote := fs.Bool("allow-remote", false, "acknowledge that --addr binds somewhere other than loopback (127.0.0.1/localhost/::1), making this port reachable from other machines. Requires --token -- this serves your account/cluster's full authorization graph, don't put it on the network with no authentication in front of it.")
 	fs.Parse(args)
+
+	host, port, err := net.SplitHostPort(*addr)
+	if err != nil {
+		fatalf("--addr %q is not a valid host:port: %v", *addr, err)
+	}
+	if !isLoopbackHost(host) {
+		if !*allowRemote {
+			fatalf("--addr %q is not loopback-only -- this would expose your full authorization graph (every principal, role, and grant) to anything that can reach this port.\n  Either use a loopback address (127.0.0.1:PORT, localhost:PORT) -- the default -- or pass both --allow-remote and --token to acknowledge this explicitly.", *addr)
+		}
+		if *token == "" {
+			fatalf("--allow-remote requires --token -- serving this graph beyond loopback with no authentication at all is the one thing this tool refuses to do by default.")
+		}
+	}
 
 	g, err := store.Load(*graphPath)
 	if err != nil {
@@ -266,9 +286,61 @@ func cmdServe(args []string) {
 	}
 
 	srv := &api.Server{Graph: g}
-	fmt.Printf("Serving %d node(s), %d edge(s) from %s on http://localhost%s\n", len(g.Nodes), len(g.AllEdges()), *graphPath, *addr)
+	httpServer := &http.Server{
+		Addr:              net.JoinHostPort(host, port),
+		Handler:           srv.Handler(*token),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	displayHost := host
+	if displayHost == "" || displayHost == "0.0.0.0" || displayHost == "::" {
+		displayHost = "localhost" // "listen on every interface" isn't a browsable hostname -- show something you can actually click
+	}
+	fmt.Printf("Serving %d node(s), %d edge(s) from %s on http://%s\n", len(g.Nodes), len(g.AllEdges()), *graphPath, net.JoinHostPort(displayHost, port))
+	if *token != "" {
+		fmt.Printf("Token required on /api/*: append ?token=%s to a URL, or send Authorization: Bearer %s\n", *token, *token)
+	}
 	fmt.Println("Note: this loads the graph once at startup -- re-run ingest-aws/ingest-k8s then restart `serve` to pick up fresh data, there is no live-reload yet.")
-	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+
+	// Graceful shutdown on Ctrl+C/SIGTERM: let any in-flight request
+	// finish (bounded by the timeout below) instead of the previous
+	// bare log.Fatal(ListenAndServe(...)), which dropped every open
+	// connection the instant the process received a signal.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.ListenAndServe() }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			fatalf("serving: %v", err)
+		}
+	case <-ctx.Done():
+		fmt.Println("\nShutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			fatalf("shutting down: %v", err)
+		}
+	}
+}
+
+// isLoopbackHost reports whether host is a form of "this machine only."
+// An empty host (net/http binds every interface when Addr's host part
+// is empty, e.g. ":8080") does NOT count, deliberately -- that's
+// exactly the accidentally-exposed-to-the-network case --allow-remote
+// exists to catch.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func fatalf(format string, args ...interface{}) {

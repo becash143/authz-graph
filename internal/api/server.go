@@ -9,12 +9,14 @@
 package api
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"io/fs"
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/becash143/authz-graph/internal/graph"
 )
@@ -31,7 +33,7 @@ type Server struct {
 	Graph *graph.Graph
 }
 
-func (s *Server) Handler() http.Handler {
+func (s *Server) Handler(authToken string) http.Handler {
 	mux := http.NewServeMux()
 
 	sub, err := fs.Sub(webFS, "web")
@@ -43,15 +45,55 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
-	mux.HandleFunc("/api/graph", s.handleGraph)
-	mux.HandleFunc("/api/principals", s.handlePrincipals)
-	mux.HandleFunc("/api/actions", s.handleActions)
-	mux.HandleFunc("/api/resources", s.handleResources)
-	mux.HandleFunc("/api/why", s.handleWhy)
-	mux.HandleFunc("/api/effective", s.handleEffective)
-	mux.HandleFunc("/api/grants", s.handleGrants)
+	// Auth applies to /api/* only, not the static UI shell -- the HTML/
+	// JS/vendored graph libraries reveal nothing about the org's actual
+	// IAM/RBAC data, only the API responses do. When authToken is ""
+	// (the loopback-only default in cmd/authz-graph's cmdServe never
+	// sets one), requireToken is a pass-through -- correct, since
+	// nothing outside the local machine can reach this port anyway.
+	api := http.NewServeMux()
+	api.HandleFunc("/api/graph", s.handleGraph)
+	api.HandleFunc("/api/principals", s.handlePrincipals)
+	api.HandleFunc("/api/actions", s.handleActions)
+	api.HandleFunc("/api/resources", s.handleResources)
+	api.HandleFunc("/api/why", s.handleWhy)
+	api.HandleFunc("/api/effective", s.handleEffective)
+	api.HandleFunc("/api/grants", s.handleGrants)
+	mux.Handle("/api/", requireToken(authToken, api))
 
 	return mux
+}
+
+// requireToken enforces a shared-secret bearer token on every request to
+// next, checked against either the standard `Authorization: Bearer
+// <token>` header or a `?token=` query parameter -- the header is the
+// correct mechanism, but a browser tab hitting one of these JSON
+// endpoints directly (e.g. for debugging) can't set custom headers via
+// the address bar, so the query-param fallback exists purely for that
+// interactive convenience. Documented tradeoff, not an oversight: query
+// params can end up in server logs/browser history in a way headers
+// don't -- fine for a token whose job is "keep casual/opportunistic
+// access off this port," not a substitute for real secret hygiene if
+// this is ever run somewhere genuinely hostile.
+func requireToken(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided := r.URL.Query().Get("token")
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			provided = strings.TrimPrefix(h, "Bearer ")
+		}
+		// Constant-time compare: this token guards a graph of exactly
+		// who-can-access-what, so it deserves the same care as any
+		// other bearer credential, not a plain == that leaks timing
+		// information about how many leading characters matched.
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			writeError(w, http.StatusUnauthorized, "missing or invalid token (Authorization: Bearer <token> header, or ?token=<token>)")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -156,7 +198,26 @@ func (s *Server) handleEffective(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": nodes})
+
+	// EffectivePrincipals returns the reachable NODE set; the UI also
+	// wants to draw how they connect, so pull the real identity edges
+	// (member_of/can_assume/bound_by -- never `grants`, which targets a
+	// resource pattern string, not another node in this set) where BOTH
+	// endpoints are in that set. These are genuine edges from the graph,
+	// not synthesized -- every one of them is exactly why its target
+	// node is reachable in the first place.
+	inSet := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		inSet[n.ID] = true
+	}
+	var edges []graph.Edge
+	for _, e := range s.Graph.AllEdges() {
+		if e.Kind != graph.EdgeGrants && inSet[e.From] && inSet[e.To] {
+			edges = append(edges, e)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": nodes, "edges": edges})
 }
 
 func (s *Server) handleGrants(w http.ResponseWriter, r *http.Request) {

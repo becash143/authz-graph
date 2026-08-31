@@ -1,9 +1,11 @@
 // authz-graph web UI. No build step, no framework -- plain fetch() +
-// Cytoscape.js (loaded via CDN in index.html), consistent with the
-// rest of this project's "no more dependencies than the thing
-// genuinely needs" stance. This file is embedded straight into the Go
-// binary (see internal/api/server.go's //go:embed) so `authz-graph
-// serve` is a single self-contained executable.
+// Cytoscape.js + the cytoscape-dagre layout extension, all vendored
+// locally (see internal/api/server.go's //go:embed) so `authz-graph
+// serve` stays a single self-contained executable with no CDN/runtime
+// network dependency -- this matters for exactly the kind of
+// air-gapped/security-conscious environment a tool that visualizes an
+// entire authorization graph is likely to run in.
+cytoscape.use(cytoscapeDagre);
 
 const NODE_COLORS = {
   aws_iam_user: "#2E6E9E",
@@ -14,65 +16,197 @@ const NODE_COLORS = {
   k8s_cluster_role: "#0B5122",
   k8s_user: "#B7791F",
   k8s_group: "#C9962F",
-  resource: "#777777",
+  resource: "#6b7280",
 };
 
-const EDGE_STYLE = {
-  member_of: { color: "#999", style: "dashed" },
-  can_assume: { color: "#B7791F", style: "dashed" },
-  bound_by: { color: "#4FA65F", style: "dashed" },
-  grants: { color: "#1E7B34", style: "solid" },
+const KIND_LABELS = {
+  aws_iam_user: "AWS IAM user",
+  aws_iam_group: "AWS IAM group",
+  aws_iam_role: "AWS IAM role",
+  k8s_service_account: "Kubernetes ServiceAccount",
+  k8s_role: "Kubernetes Role",
+  k8s_cluster_role: "Kubernetes ClusterRole",
+  k8s_user: "Kubernetes User (inferred)",
+  k8s_group: "Kubernetes Group (inferred)",
+  resource: "Resource (grant target)",
 };
+
+// Grant edges are colored by Effect (Allow=green, Deny=red) rather than
+// a flat "grants" color -- an explicit Deny is a meaningfully different,
+// security-relevant thing to see in this graph, not a styling detail.
+// Identity/membership edges (member_of/can_assume/bound_by) all render
+// the same dashed gray -- the distinction that matters visually is
+// "this is how you get somewhere" vs. "this is what you're actually
+// allowed to do once you're there," not which specific identity
+// mechanism applies.
+function edgeColor(data) {
+  if (data.kind === "grants") return data.effect === "Deny" ? "#B42318" : "#1E7B34";
+  return "#94a3b8";
+}
+function edgeLineStyle(data) {
+  return data.kind === "grants" ? "solid" : "dashed";
+}
+function edgeWidth(data) {
+  return data.kind === "grants" ? 2 : 1.2;
+}
 
 let cy = null;
+const tooltip = () => document.getElementById("graph-tooltip");
 
 function initCytoscape() {
   cy = cytoscape({
     container: document.getElementById("cy"),
+    minZoom: 0.05,
+    maxZoom: 4,
     style: [
       {
         selector: "node",
         style: {
           "background-color": (n) => NODE_COLORS[n.data("kind")] || "#999",
+          shape: (n) => (n.data("kind") === "resource" ? "round-rectangle" : "ellipse"),
+          // Node size reflects degree (how many edges touch it) --
+          // a ClusterRole bound by 40 things should visually read as
+          // more central than a leaf ServiceAccount, which a uniform
+          // fixed size (the previous behavior) can't convey at all.
+          width: (n) => Math.min(52, 20 + Math.sqrt(n.degree()) * 6),
+          height: (n) => Math.min(52, 20 + Math.sqrt(n.degree()) * 6),
           label: "data(label)",
-          "font-size": 9,
-          color: "#222",
+          "font-size": 10.5,
+          "font-family": "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif",
+          color: "#1a2433",
           "text-valign": "bottom",
-          "text-margin-y": 4,
-          width: 22,
-          height: 22,
+          "text-margin-y": 5,
+          "text-wrap": "wrap",
+          "text-max-width": "120px",
+          "text-background-color": "#ffffff",
+          "text-background-opacity": 0.85,
+          "text-background-shape": "roundrectangle",
+          "text-background-padding": "2px",
+          "border-width": 1.5,
+          "border-color": "#ffffff",
         },
       },
       {
         selector: "edge",
         style: {
-          width: 1.5,
-          "line-color": (e) => (EDGE_STYLE[e.data("kind")] || {}).color || "#ccc",
-          "line-style": (e) => (EDGE_STYLE[e.data("kind")] || {}).style || "solid",
+          width: (e) => edgeWidth(e.data()),
+          "line-color": (e) => edgeColor(e.data()),
+          "line-style": (e) => edgeLineStyle(e.data()),
           "target-arrow-shape": "triangle",
-          "target-arrow-color": (e) => (EDGE_STYLE[e.data("kind")] || {}).color || "#ccc",
+          "target-arrow-color": (e) => edgeColor(e.data()),
+          "arrow-scale": 0.9,
           "curve-style": "bezier",
-          label: "data(label)",
-          "font-size": 8,
-          "text-rotation": "autorotate",
-          color: "#555",
+          opacity: 0.85,
+          // No permanent edge labels -- with more than a couple dozen
+          // edges on screen at once (routine for a real cluster's
+          // grants), always-on labels overlap into an unreadable mess.
+          // Full detail (kind/effect/action/resource/granted-via) is a
+          // hover away -- see the graph-tooltip wiring below -- and the
+          // left-hand results panel already shows the same detail as
+          // structured text for the current query.
         },
       },
-      {
-        selector: "node.faded",
-        style: { opacity: 0.12 },
-      },
-      {
-        selector: "edge.faded",
-        style: { opacity: 0.06 },
-      },
-      {
-        selector: "node.matched",
-        style: { "border-width": 3, "border-color": "#000" },
-      },
+      { selector: "node.faded", style: { opacity: 0.12 } },
+      { selector: "edge.faded", style: { opacity: 0.05 } },
+      { selector: "node.matched", style: { "border-width": 3, "border-color": "#111827" } },
     ],
-    layout: { name: "cose", animate: false },
+    layout: dagreLayoutOptions(),
   });
+
+  wireGraphInteractions();
+  wireToolbar();
+  updateEmptyState();
+}
+
+// dagre (a hierarchical/layered layout) is a much better fit for this
+// graph than the previous default (`cose`, force-directed) -- almost
+// everything here is fundamentally a DAG (principal -> group/role ->
+// policy/binding -> grant), and a layered top-down/left-right layout
+// makes that chain structure immediately legible. Force-directed
+// layouts are the right tool for graphs without inherent direction;
+// this graph has direction built into every edge kind.
+function dagreLayoutOptions() {
+  return {
+    name: "dagre",
+    rankDir: "LR",
+    nodeSep: 32,
+    rankSep: 90,
+    edgeSep: 8,
+    animate: false,
+  };
+}
+
+function wireGraphInteractions() {
+  const tt = tooltip();
+
+  function showTooltip(evt, html) {
+    tt.innerHTML = html;
+    tt.hidden = false;
+    positionTooltip(evt);
+  }
+  function positionTooltip(evt) {
+    const oe = evt.originalEvent;
+    if (!oe) return;
+    const pad = 16;
+    // Keep the tooltip on-screen near the right/bottom edges rather
+    // than letting it run off the viewport.
+    const maxLeft = window.innerWidth - 380;
+    const maxTop = window.innerHeight - 100;
+    tt.style.left = Math.min(oe.clientX + pad, maxLeft) + "px";
+    tt.style.top = Math.min(oe.clientY + pad, maxTop) + "px";
+  }
+  function hideTooltip() {
+    tt.hidden = true;
+  }
+
+  cy.on("mouseover", "node", (evt) => showTooltip(evt, nodeTooltipHTML(evt.target.data())));
+  cy.on("mousemove", "node", positionTooltip);
+  cy.on("mouseout", "node", hideTooltip);
+
+  cy.on("mouseover", "edge", (evt) => showTooltip(evt, edgeTooltipHTML(evt.target.data())));
+  cy.on("mousemove", "edge", positionTooltip);
+  cy.on("mouseout", "edge", hideTooltip);
+
+  cy.on("pan zoom", hideTooltip); // don't leave a stale tooltip floating while the view moves
+}
+
+function nodeTooltipHTML(data) {
+  const kindLabel = KIND_LABELS[data.kind] || data.kind;
+  return `<div class="tt-title">${escapeHTML(data.label)}</div>` +
+    `<div class="tt-row"><b>Kind:</b> ${escapeHTML(kindLabel)}</div>` +
+    (data.label !== data.id ? `<div class="tt-row"><b>ID:</b> ${escapeHTML(data.id)}</div>` : "");
+}
+
+function edgeTooltipHTML(data) {
+  if (data.kind === "grants") {
+    return `<div class="tt-title">${escapeHTML(data.effect || "Allow")} &middot; ${escapeHTML(data.action || "")}</div>` +
+      `<div class="tt-row"><b>Resource:</b> ${escapeHTML(data.resource || "")}</div>` +
+      (data.grantedVia ? `<div class="tt-row"><b>Via:</b> ${escapeHTML(data.grantedVia)}</div>` : "");
+  }
+  return `<div class="tt-title">${escapeHTML(data.kind)}</div>` +
+    (data.grantedVia ? `<div class="tt-row"><b>Via:</b> ${escapeHTML(data.grantedVia)}</div>` : "");
+}
+
+function wireToolbar() {
+  document.getElementById("zoom-in-btn").addEventListener("click", () => zoomBy(1.25));
+  document.getElementById("zoom-out-btn").addEventListener("click", () => zoomBy(0.8));
+  document.getElementById("fit-btn").addEventListener("click", () => cy.fit(undefined, 40));
+  document.getElementById("relayout-btn").addEventListener("click", () => {
+    cy.layout(dagreLayoutOptions()).run();
+    cy.fit(undefined, 40);
+  });
+}
+
+function zoomBy(factor) {
+  cy.zoom({
+    level: cy.zoom() * factor,
+    renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+  });
+}
+
+function updateEmptyState() {
+  const el = document.getElementById("graph-empty-state");
+  el.classList.toggle("hidden", cy.elements().length > 0);
 }
 
 function renderElements(nodes, edges) {
@@ -92,12 +226,17 @@ function renderElements(nodes, edges) {
         target: e.to,
         kind: e.kind,
         label: e.kind === "grants" ? e.action : e.kind,
+        effect: e.effect,
+        action: e.action,
+        resource: e.resource,
+        grantedVia: e.grantedVia,
       },
     });
   }
   cy.add(els);
-  cy.layout({ name: "cose", animate: false }).run();
+  cy.layout(dagreLayoutOptions()).run();
   cy.fit(undefined, 40);
+  updateEmptyState();
 
   // A fresh render replaces the element set entirely -- any filter
   // applied against the previous set no longer means anything, so
@@ -311,11 +450,19 @@ function pathsToElements(paths) {
         const resourceID = "resource:" + hop.Edge.Resource;
         nodes.push({ id: hop.From.ID, name: hop.From.Name || hop.From.ID, kind: hop.From.Kind });
         nodes.push({ id: resourceID, name: hop.Edge.Resource, kind: "resource" });
-        edges.push({ from: hop.Edge.From, to: resourceID, kind: "grants", action: hop.Edge.Action });
+        edges.push({
+          from: hop.Edge.From,
+          to: resourceID,
+          kind: "grants",
+          action: hop.Edge.Action,
+          effect: hop.Edge.Effect,
+          resource: hop.Edge.Resource,
+          grantedVia: hop.Edge.GrantedVia,
+        });
       } else {
         nodes.push({ id: hop.From.ID, name: hop.From.Name || hop.From.ID, kind: hop.From.Kind });
         nodes.push({ id: hop.To.ID, name: hop.To.Name || hop.To.ID, kind: hop.To.Kind });
-        edges.push({ from: hop.Edge.From, to: hop.Edge.To, kind: hop.Edge.Kind });
+        edges.push({ from: hop.Edge.From, to: hop.Edge.To, kind: hop.Edge.Kind, grantedVia: hop.Edge.GrantedVia });
       }
     }
   }
@@ -379,11 +526,12 @@ async function runEffective() {
       nodes.map((n) => `<div class="hop">${escapeHTML(n.ID)} <span class="muted">(${escapeHTML(n.Kind)})</span></div>`).join("") +
       `</div>`;
     const mapped = nodes.map((n) => ({ id: n.ID, name: n.Name || n.ID, kind: n.Kind }));
-    const edges = [];
-    for (let i = 0; i < mapped.length - 1; i++) {
-      edges.push({ from: mapped[i].id, to: mapped[i + 1].id, kind: "member_of" });
-    }
-    renderElements(mapped, []); // edges omitted here -- effective-set order isn't a real path, only the reachable node set matters
+    // Real edges from the graph connecting this reachable set (see
+    // handleEffective in internal/api/server.go) -- not synthesized,
+    // so the drawing shows exactly why each node is reachable, not
+    // just a disconnected cloud of nodes that happen to be related.
+    const edges = (body.edges || []).map((e) => ({ from: e.From, to: e.To, kind: e.Kind, grantedVia: e.GrantedVia }));
+    renderElements(mapped, edges);
   } catch (e) {
     renderResultsError(e.message);
   }
@@ -422,7 +570,15 @@ async function runGrants() {
       const resourceID = "resource:" + g.Edge.Resource;
       nodes.push({ id: g.HeldBy.ID, name: g.HeldBy.Name || g.HeldBy.ID, kind: g.HeldBy.Kind });
       nodes.push({ id: resourceID, name: g.Edge.Resource, kind: "resource" });
-      edges.push({ from: g.HeldBy.ID, to: resourceID, kind: "grants", action: g.Edge.Action });
+      edges.push({
+        from: g.HeldBy.ID,
+        to: resourceID,
+        kind: "grants",
+        action: g.Edge.Action,
+        effect: g.Edge.Effect,
+        resource: g.Edge.Resource,
+        grantedVia: g.Edge.GrantedVia,
+      });
     }
     renderElements(nodes, edges);
   } catch (e) {
@@ -435,9 +591,9 @@ async function runFullGraph() {
     const body = await fetchJSON("/api/graph");
     const nodes = (body.nodes || []).map((n) => ({ id: n.ID, name: n.Name || n.ID, kind: n.Kind }));
     const edges = (body.edges || [])
-      .filter((e) => e.Kind !== "grants") // grants edges' target is a resource pattern, not a node -- omit from the full-graph identity view to avoid thousands of synthetic resource nodes; use "Why" for grant-level detail on a specific principal
-      .map((e) => ({ from: e.From, to: e.To, kind: e.Kind }));
-    document.getElementById("results").innerHTML = `<div class="muted">Showing ${nodes.length} nodes and ${edges.length} identity/membership edges (grants edges omitted here -- use "Why" for grant-level detail).</div>`;
+      .filter((e) => e.Kind !== "grants") // grants edges' target is a resource pattern, not a node -- omit from the full-graph identity view to avoid thousands of synthetic resource nodes; use "Why"/"List all grants" for grant-level detail on a specific principal
+      .map((e) => ({ from: e.From, to: e.To, kind: e.Kind, grantedVia: e.GrantedVia }));
+    document.getElementById("results").innerHTML = `<div class="muted">Showing ${nodes.length} nodes and ${edges.length} identity/membership edges (grants edges omitted here -- use "Why" or "List all grants" for grant-level detail).</div>`;
     renderElements(nodes, edges);
   } catch (e) {
     renderResultsError(e.message);

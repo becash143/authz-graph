@@ -117,42 +117,97 @@ a direct result -- documented here rather than glossed over:
   clusters may expose the Kubernetes plugin's columns slightly
   differently -- if `ingest-k8s` errors on a column name, that's a real
   bug report, not user error.
-- The web UI (below) is new and has been verified at the API/data
-  layer, not yet visually confirmed in a browser in this environment
-  -- see its section for exactly what was and wasn't checked.
+- No persistent database backend or multi-user/multi-tenant support --
+  this is a single-operator local tool with a single JSON graph file,
+  by design (see "Why this shape" above), not a hosted product.
+- No live-reload in `serve` (restart to pick up a fresh ingest) and no
+  built-in TLS termination -- if you do run this beyond loopback (see
+  the Web UI section's `--allow-remote` flow), put a real TLS-terminating
+  reverse proxy in front of it; `serve`'s own token check is
+  authentication, not encryption-in-transit.
+
+**Fixed in the production-hardening pass** (previously real gaps,
+listed here rather than quietly dropped from history):
+- `serve` used to default to binding every network interface
+  (`:8080`, which Go's `net/http` treats as "all interfaces," not
+  "localhost") with zero authentication. Now defaults to
+  `127.0.0.1:8080`, and refuses to bind anywhere else without an
+  explicit `--allow-remote` + `--token`.
+- The web UI's graph library loaded from a public CDN at runtime --
+  now vendored and embedded in the binary, so `serve` has no network
+  dependency at all.
+- Bare `http.ListenAndServe` with no timeouts and no graceful shutdown
+  -- now has read/write/idle timeouts and shuts down cleanly on
+  Ctrl-C/SIGTERM.
+- `internal/api` had zero test coverage -- now covers every handler
+  plus the token-auth middleware (`internal/api/server_test.go`).
+- The graph visualization itself used a force-directed layout
+  (`cose`), which is the wrong tool for what is fundamentally a DAG --
+  see the Web UI section for the switch to a hierarchical (dagre)
+  layout, degree-based node sizing, Allow/Deny edge coloring, and
+  hover tooltips replacing permanently-on edge labels.
 
 ## Web UI
 
 `authz-graph serve` starts a local web UI + JSON API over an already-ingested
 graph file -- a single self-contained binary, no separate frontend
-build or deploy step (the UI is embedded into the binary via Go's
-`embed` package).
+build or deploy step, and **no network dependency at all**: Cytoscape.js
+and the dagre layout engine are vendored and embedded into the binary
+via Go's `embed` package (previously loaded from a CDN -- removed, see
+below), so this works fully air-gapped.
 
 ```
 go build -o authz-graph ./cmd/authz-graph
 ./authz-graph ingest-aws && ./authz-graph ingest-k8s   # or against the fake fixture, see below
-./authz-graph serve --addr :8080
+./authz-graph serve
 # open http://localhost:8080
 ```
 
-It gives you: a principal search (autocomplete over everything
-ingested), a "why" query with results rendered both as text and as an
-interactive graph (powered by [Cytoscape.js](https://js.cytoscape.org/),
-loaded from a CDN -- the one external dependency in this entire
-project, and it's client-side JS in your browser, not a Go module),
-an "effective principal set" view, and a full-graph explorer.
+It gives you: a principal/action/resource search with a live-filtering
+dropdown, a "why" query rendered as both text and an interactive
+graph, an "effective principal set" view, a "list all grants" view, and
+a full-graph explorer -- with zoom/fit/re-layout controls and a
+type-to-filter search over whatever's currently drawn.
 
-**What's verified vs. not, honestly:** the JSON API
-(`/api/graph`, `/api/principals`, `/api/why`, `/api/effective`) was
-tested directly with `curl` against a real ingested graph and returns
-the exact shape the frontend code expects -- checked by hand,
-field-for-field. What I could *not* verify in the sandbox this was
-built in: the actual rendered graph in a browser. Cytoscape.js loads
-from `cdnjs.cloudflare.com`, which that sandbox's network policy
-didn't allow reaching, so the visual rendering itself needs a real
-look before you trust it -- it's the one piece here that's "should
-work, carefully written against the verified API shape" rather than
-"confirmed working."
+**Graph rendering:** uses a hierarchical (dagre) layout instead of a
+force-directed one -- this graph is fundamentally a DAG (principal ->
+group/role -> policy/binding -> grant), and a layered layout makes that
+chain immediately readable in a way force-directed layouts don't. Node
+size reflects degree (a ClusterRole bound by 40 things visually reads
+as more central than a leaf ServiceAccount). Grant edges are colored by
+Effect -- green for Allow, red for Deny -- so a Deny is something you
+*see*, not something you have to go looking for. Edge labels are hidden
+by default (with dozens of edges on screen, always-on labels overlap
+into noise) and shown instead as a hover tooltip, along with node
+detail (kind, full ID).
+
+**Auth and network exposure:** `serve` binds to `127.0.0.1` only by
+default -- this tool visualizes your account/cluster's complete
+authorization graph, and that has no business being reachable from
+anywhere but the machine you're running it on unless you explicitly
+say otherwise:
+
+```
+# loopback only, no token needed (the default, and the common case)
+./authz-graph serve
+
+# deliberately expose beyond loopback -- requires acknowledging it
+./authz-graph serve --addr 0.0.0.0:8080 --allow-remote --token "$(openssl rand -hex 16)"
+```
+
+Passing a non-loopback `--addr` without both `--allow-remote` and
+`--token` refuses to start, with an explanation of why, rather than
+silently binding to every interface with zero authentication (the
+previous default). The token check applies to `/api/*` only (the
+static UI shell itself reveals nothing) and accepts either an
+`Authorization: Bearer <token>` header or a `?token=` query param (the
+latter purely for pasting a URL into a browser -- the header is the
+correct mechanism if you're scripting against it).
+
+**Other hardening:** the HTTP server now has real read/write/idle
+timeouts (a bare `http.ListenAndServe` has none, which is a real
+Slowloris-class risk) and shuts down gracefully on Ctrl-C/SIGTERM
+instead of dropping in-flight connections.
 
 No live-reload yet -- `serve` loads the graph file once at startup, so
 re-run `ingest-aws`/`ingest-k8s` and restart `serve` to pick up fresh
@@ -160,6 +215,7 @@ data. Fine for the current CLI-first workflow; worth revisiting if the
 UI becomes the primary way this gets used.
 
 ## Try it (no AWS account or cluster needed)
+
 
 `internal/steampipe/testdata/fake_steampipe.sh` stands in for the real
 `steampipe` binary and returns fixed fixtures: `alice` → `engineers`

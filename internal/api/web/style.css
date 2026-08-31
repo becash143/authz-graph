@@ -3,6 +3,7 @@
   --accent: #2E6E9E;
   --bg: #F7F9FB;
   --border: #CBD5E1;
+  --canvas-bg: #FCFDFE;
 }
 * { box-sizing: border-box; }
 body {
@@ -112,7 +113,51 @@ main { flex: 1; position: relative; display: flex; flex-direction: column; }
   width: 280px;
   margin: 0;
 }
-#cy { width: 100%; flex: 1; }
+.toolbar-spacer { flex: 1; }
+.icon-btn {
+  width: auto;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+#cy { width: 100%; flex: 1; background: var(--canvas-bg); }
+
+/* Floating tooltip for graph node/edge hover -- full ID/kind/details on
+   demand instead of permanently-on labels cluttering the canvas (see
+   app.js's cytoscape style comment for why edge labels are off by
+   default). Positioned in JS to track the cursor. */
+#graph-tooltip {
+  position: fixed;
+  z-index: 50;
+  max-width: 360px;
+  background: #1a2433;
+  color: #e8edf3;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  pointer-events: none;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+}
+#graph-tooltip[hidden] { display: none; }
+#graph-tooltip .tt-title { font-weight: 700; margin-bottom: 2px; word-break: break-all; }
+#graph-tooltip .tt-row { color: #aebbcc; }
+#graph-tooltip .tt-row b { color: #e8edf3; font-weight: 600; }
+
+#graph-empty-state {
+  position: absolute;
+  inset: 0;
+  top: 41px; /* below the toolbar */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: #8a97a8;
+  pointer-events: none;
+}
+#graph-empty-state p { margin: 2px 0; }
+#graph-empty-state.hidden { display: none; }
 
 #results { font-size: 12.5px; }
 #results .path { border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin-bottom: 8px; background: var(--bg); cursor: pointer; }
@@ -121,8 +166,19 @@ main { flex: 1; position: relative; display: flex; flex-direction: column; }
 #results .error { color: #b42318; }
 #results .empty { color: #666; font-style: italic; }
 
-.legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; color: #444; }
-.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+#legend details summary {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 5px; color: #444; }
+.legend-item.legend-edge { margin-top: 4px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.square { width: 9px; height: 9px; display: inline-block; flex-shrink: 0; }
+.line { width: 20px; height: 0; border-top-width: 2px; display: inline-block; flex-shrink: 0; }
 .dot.aws_iam_user { background: #2E6E9E; }
 .dot.aws_iam_group { background: #5B8FB9; }
 .dot.aws_iam_role { background: #1F3A5F; }
@@ -131,4 +187,7 @@ main { flex: 1; position: relative; display: flex; flex-direction: column; }
 .dot.k8s_cluster_role { background: #0B5122; }
 .dot.k8s_user { background: #B7791F; }
 .dot.k8s_group { background: #C9962F; }
-.dot.resource { background: #777; }
+.square.resource { background: #6b7280; }
+.line.grant-allow { border-top-style: solid; border-top-color: #1E7B34; }
+.line.grant-deny { border-top-style: solid; border-top-color: #B42318; }
+.line.identity { border-top-style: dashed; border-top-color: #94a3b8; }

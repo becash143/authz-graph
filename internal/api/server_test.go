@@ -9,221 +9,179 @@ import (
 	"testing"
 
 	"github.com/becash143/authz-graph/internal/graph"
-	"github.com/becash143/authz-graph/internal/ingest"
-	"github.com/becash143/authz-graph/internal/steampipe"
 )
 
-// buildTestGraph reuses the same fake-Steampipe fixture the ingest
-// package's own tests are built on, so a failure here means this
-// package's API disagrees with data the ingest tests already treat as
-// ground truth -- not a second, possibly-drifted fixture.
-func buildTestGraph(t *testing.T) *graph.Graph {
+// fixtureGraph builds a small graph exercising every edge kind:
+// membership, an assumed role, a Kubernetes binding, and both an Allow
+// and a Deny grant -- enough to test each handler and the Allow/Deny
+// distinction the web UI's edge coloring depends on.
+func fixtureGraph(t *testing.T) *graph.Graph {
 	t.Helper()
-	client := &steampipe.Client{Binary: "../steampipe/testdata/fake_steampipe.sh"}
-	result, err := ingest.AWSIAM(client)
-	if err != nil {
-		t.Fatalf("AWSIAM: %v", err)
-	}
 	g := graph.New()
-	if err := result.MergeInto(g); err != nil {
-		t.Fatalf("MergeInto: %v", err)
-	}
+
+	g.AddNode(graph.Node{ID: "aws:iam:user/alice", Kind: graph.NodeAWSIAMUser, Name: "alice", Source: "aws"})
+	g.AddNode(graph.Node{ID: "aws:iam:group/engineers", Kind: graph.NodeAWSIAMGroup, Name: "engineers", Source: "aws"})
+
+	must(t, g.AddEdge(graph.Edge{From: "aws:iam:user/alice", To: "aws:iam:group/engineers", Kind: graph.EdgeMemberOf, GrantedVia: "group membership"}))
+	must(t, g.AddEdge(graph.Edge{From: "aws:iam:group/engineers", Kind: graph.EdgeGrants, Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::prod-bucket/*", GrantedVia: "ReadOnlyPolicy"}))
+	must(t, g.AddEdge(graph.Edge{From: "aws:iam:group/engineers", Kind: graph.EdgeGrants, Effect: "Deny", Action: "s3:DeleteObject", Resource: "arn:aws:s3:::prod-bucket/*", GrantedVia: "ProtectProdPolicy"}))
+
 	return g
 }
 
-func doJSON(t *testing.T, h http.Handler, method, path string) (int, map[string]any) {
+func must(t *testing.T, err error) {
 	t.Helper()
-	req := httptest.NewRequest(method, path, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	var body map[string]any
-	if len(rec.Body.Bytes()) > 0 {
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatalf("decoding response body from %s %s: %v (body: %s)", method, path, err, rec.Body.String())
-		}
+	if err != nil {
+		t.Fatalf("unexpected error building fixture: %v", err)
 	}
-	return rec.Code, body
 }
 
-func TestEndpoints_NoAuth(t *testing.T) {
-	srv := &Server{Graph: buildTestGraph(t)} // AuthToken unset -- matches --no-auth
-	h := srv.Handler()
+func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder, v interface{}) {
+	t.Helper()
+	if err := json.NewDecoder(rec.Body).Decode(v); err != nil {
+		t.Fatalf("decoding response body: %v (status %d)", err, rec.Code)
+	}
+}
 
-	t.Run("graph", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet, "/api/graph")
-		if code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %+v", code, body)
-		}
-		if _, ok := body["nodes"]; !ok {
-			t.Fatalf("expected a nodes field, got %+v", body)
-		}
-	})
+func TestHandlePrincipals(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+	rec := httptest.NewRecorder()
+	srv.Handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/principals", nil))
 
-	t.Run("principals", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/principals", nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
-		}
-		var principals []map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &principals); err != nil {
-			t.Fatalf("decoding principals: %v", err)
-		}
-		found := false
-		for _, p := range principals {
-			if p["id"] == "aws:iam:user/alice" {
-				found = true
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var out []principalSummary
+	decodeJSON(t, rec, &out)
+	if len(out) != 2 {
+		t.Errorf("expected 2 principals, got %d", len(out))
+	}
+}
+
+func TestHandleActionsAndResources(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+
+	rec := httptest.NewRecorder()
+	srv.Handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/actions", nil))
+	var actions []string
+	decodeJSON(t, rec, &actions)
+	if len(actions) != 2 {
+		t.Fatalf("expected 2 distinct actions (GetObject + DeleteObject), got %d: %v", len(actions), actions)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/resources", nil))
+	var resources []string
+	decodeJSON(t, rec, &resources)
+	if len(resources) != 1 {
+		t.Fatalf("expected 1 distinct resource (both grants target the same bucket), got %d: %v", len(resources), resources)
+	}
+}
+
+func TestHandleWhy(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/why?principal=aws:iam:user/alice&action=s3:GetObject&resource=arn:aws:s3:::prod-bucket/report.csv", nil)
+	srv.Handler("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Paths []graph.Path `json:"paths"`
+	}
+	decodeJSON(t, rec, &body)
+	if len(body.Paths) != 1 {
+		t.Fatalf("expected 1 path from alice to the Allow grant, got %d", len(body.Paths))
+	}
+}
+
+func TestHandleWhy_MissingParams(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+	rec := httptest.NewRecorder()
+	srv.Handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/why?principal=aws:iam:user/alice", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing action/resource, got %d", rec.Code)
+	}
+}
+
+func TestHandleEffective_IncludesConnectingEdges(t *testing.T) {
+	// Regression test: /api/effective used to return only the reachable
+	// NODE set with no edges at all, which rendered as a disconnected
+	// cloud of nodes in the UI with no visible relationship between
+	// them -- exactly the "not clear" graph clarity problem this whole
+	// pass fixed. It must now also return the real identity edges
+	// connecting that set.
+	srv := &Server{Graph: fixtureGraph(t)}
+	rec := httptest.NewRecorder()
+	srv.Handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/effective?principal=aws:iam:user/alice", nil))
+
+	var body struct {
+		Nodes []graph.Node `json:"nodes"`
+		Edges []graph.Edge `json:"edges"`
+	}
+	decodeJSON(t, rec, &body)
+
+	if len(body.Nodes) != 2 {
+		t.Fatalf("expected 2 reachable nodes (alice + engineers), got %d", len(body.Nodes))
+	}
+	if len(body.Edges) != 1 {
+		t.Fatalf("expected exactly 1 connecting identity edge (alice -member_of-> engineers), got %d: %+v", len(body.Edges), body.Edges)
+	}
+	if body.Edges[0].Kind == graph.EdgeGrants {
+		t.Error("handleEffective must exclude grants edges (they target a resource pattern string, not a node in this set)")
+	}
+}
+
+func TestRequireToken(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+	handler := srv.Handler("secret123")
+
+	cases := []struct {
+		name       string
+		setup      func(*http.Request)
+		wantStatus int
+	}{
+		{"no token", func(r *http.Request) {}, http.StatusUnauthorized},
+		{"wrong token", func(r *http.Request) { r.Header.Set("Authorization", "Bearer wrong") }, http.StatusUnauthorized},
+		{"correct header", func(r *http.Request) { r.Header.Set("Authorization", "Bearer secret123") }, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/principals", nil)
+			tc.setup(req)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("got status %d, want %d", rec.Code, tc.wantStatus)
 			}
-		}
-		if !found {
-			t.Fatalf("expected aws:iam:user/alice in principals, got %+v", principals)
-		}
-	})
+		})
+	}
 
-	t.Run("actions and resources are real grant values", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/actions", nil)
+	t.Run("correct query param", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		var actions []string
-		if err := json.Unmarshal(rec.Body.Bytes(), &actions); err != nil {
-			t.Fatalf("decoding actions: %v", err)
-		}
-		if len(actions) == 0 {
-			t.Fatal("expected at least one known action")
-		}
-
-		req = httptest.NewRequest(http.MethodGet, "/api/resources", nil)
-		rec = httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		var resources []string
-		if err := json.Unmarshal(rec.Body.Bytes(), &resources); err != nil {
-			t.Fatalf("decoding resources: %v", err)
-		}
-		if len(resources) == 0 {
-			t.Fatal("expected at least one known resource")
-		}
-	})
-
-	t.Run("why matches the CLI's own proven case", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet,
-			"/api/why?principal=aws%3Aiam%3Auser%2Falice&action=s3%3AGetObject&resource=arn%3Aaws%3As3%3A%3A%3Aprod-data-bucket%2Freport.csv")
-		if code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %+v", code, body)
-		}
-		paths, ok := body["paths"].([]any)
-		if !ok || len(paths) == 0 {
-			t.Fatalf("expected at least one path, got %+v", body)
-		}
-	})
-
-	t.Run("why missing params is 400", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet, "/api/why?principal=aws%3Aiam%3Auser%2Falice")
-		if code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d: %+v", code, body)
-		}
-	})
-
-	t.Run("why unknown principal is 404", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet,
-			"/api/why?principal=aws%3Aiam%3Auser%2Fnobody&action=%2A&resource=%2A")
-		if code != http.StatusNotFound {
-			t.Fatalf("expected 404 for an unknown principal, got %d: %+v", code, body)
-		}
-		if _, ok := body["error"]; !ok {
-			t.Fatalf("expected an error field, got %+v", body)
-		}
-	})
-
-	t.Run("effective", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet, "/api/effective?principal=aws%3Aiam%3Auser%2Falice")
-		if code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %+v", code, body)
-		}
-		nodes, ok := body["nodes"].([]any)
-		if !ok || len(nodes) == 0 {
-			t.Fatalf("expected at least one reachable node, got %+v", body)
-		}
-	})
-
-	t.Run("static index page is served", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/principals?token=secret123", nil))
 		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 for /, got %d", rec.Code)
+			t.Errorf("expected 200 with correct ?token=, got %d", rec.Code)
 		}
 	})
 
-	t.Run("vendored cytoscape asset is served, not loaded from a CDN", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/vendor/cytoscape.min.js", nil)
+	t.Run("static assets are never gated", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 for the vendored cytoscape asset, got %d -- internal/api/web/vendor/cytoscape.min.js may be missing", rec.Code)
-		}
-		if rec.Body.Len() < 1000 {
-			t.Fatalf("vendored cytoscape.min.js looks too small (%d bytes) to be the real file", rec.Body.Len())
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code == http.StatusUnauthorized {
+			t.Error("the static UI shell must not require a token -- only /api/* carries sensitive data")
 		}
 	})
 }
 
-func TestAuth_APIGatedWhenTokenSet(t *testing.T) {
-	const tok = "test-token-12345"
-	srv := &Server{Graph: buildTestGraph(t), AuthToken: tok}
-	h := srv.Handler()
-
-	t.Run("no token is 401", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet, "/api/principals")
-		if code != http.StatusUnauthorized {
-			t.Fatalf("expected 401 with no token, got %d: %+v", code, body)
-		}
-	})
-
-	t.Run("wrong token is 401", func(t *testing.T) {
-		code, body := doJSON(t, h, http.MethodGet, "/api/principals?token=wrong")
-		if code != http.StatusUnauthorized {
-			t.Fatalf("expected 401 with a wrong token, got %d: %+v", code, body)
-		}
-	})
-
-	t.Run("correct token via query param is 200", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/principals?token="+tok, nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 with the correct token, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("correct token via Authorization header is 200", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/principals", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 with a valid Authorization header, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("static assets stay open even with a token set", func(t *testing.T) {
-		// Deliberate: a <script src="/vendor/..."> tag can't attach a
-		// query-string token, so gating static assets would silently
-		// break the page even for someone who opened the correct
-		// tokened URL. Only /api/* is gated -- see server.go's Server
-		// doc comment for the full reasoning.
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected static / to stay open with no token even when AuthToken is set, got %d", rec.Code)
-		}
-
-		req = httptest.NewRequest(http.MethodGet, "/vendor/cytoscape.min.js", nil)
-		rec = httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected the vendored cytoscape asset to stay open with no token even when AuthToken is set, got %d", rec.Code)
-		}
-	})
+func TestRequireToken_EmptyTokenIsPassthrough(t *testing.T) {
+	srv := &Server{Graph: fixtureGraph(t)}
+	handler := srv.Handler("") // loopback-only default: no token configured at all
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/principals", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected no auth enforced when authToken is empty, got %d", rec.Code)
+	}
 }

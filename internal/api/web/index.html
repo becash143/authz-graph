@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <title>authz-graph</title>
 <link rel="stylesheet" href="/style.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<script src="/cytoscape.min.js"></script>
+<script src="/dagre.min.js"></script>
+<script src="/cytoscape-dagre.js"></script>
 </head>
 <body>
   <header>
@@ -64,16 +66,21 @@
       </section>
 
       <section id="legend">
-        <h2>Legend</h2>
-        <div class="legend-item"><span class="dot aws_iam_user"></span>AWS IAM user</div>
-        <div class="legend-item"><span class="dot aws_iam_group"></span>AWS IAM group</div>
-        <div class="legend-item"><span class="dot aws_iam_role"></span>AWS IAM role</div>
-        <div class="legend-item"><span class="dot k8s_service_account"></span>K8s ServiceAccount</div>
-        <div class="legend-item"><span class="dot k8s_role"></span>K8s Role</div>
-        <div class="legend-item"><span class="dot k8s_cluster_role"></span>K8s ClusterRole</div>
-        <div class="legend-item"><span class="dot k8s_user"></span>K8s User (inferred)</div>
-        <div class="legend-item"><span class="dot k8s_group"></span>K8s Group (inferred)</div>
-        <div class="legend-item"><span class="dot resource"></span>Resource (grant target)</div>
+        <details open>
+          <summary>Legend</summary>
+          <div class="legend-item"><span class="dot aws_iam_user"></span>AWS IAM user</div>
+          <div class="legend-item"><span class="dot aws_iam_group"></span>AWS IAM group</div>
+          <div class="legend-item"><span class="dot aws_iam_role"></span>AWS IAM role</div>
+          <div class="legend-item"><span class="dot k8s_service_account"></span>K8s ServiceAccount</div>
+          <div class="legend-item"><span class="dot k8s_role"></span>K8s Role</div>
+          <div class="legend-item"><span class="dot k8s_cluster_role"></span>K8s ClusterRole</div>
+          <div class="legend-item"><span class="dot k8s_user"></span>K8s User (inferred)</div>
+          <div class="legend-item"><span class="dot k8s_group"></span>K8s Group (inferred)</div>
+          <div class="legend-item"><span class="square resource"></span>Resource (grant target)</div>
+          <div class="legend-item legend-edge"><span class="line grant-allow"></span>Allow grant</div>
+          <div class="legend-item legend-edge"><span class="line grant-deny"></span>Deny grant</div>
+          <div class="legend-item legend-edge"><span class="line identity"></span>Membership / binding</div>
+        </details>
       </section>
 
       <section id="results"></section>
@@ -83,8 +90,18 @@
       <div id="graph-toolbar">
         <input id="node-filter-input" placeholder="Type to filter node IDs..." autocomplete="off">
         <span id="filter-count" class="muted"></span>
+        <div class="toolbar-spacer"></div>
+        <button id="zoom-in-btn" class="icon-btn" title="Zoom in">+</button>
+        <button id="zoom-out-btn" class="icon-btn" title="Zoom out">&minus;</button>
+        <button id="fit-btn" class="icon-btn" title="Fit graph to screen">Fit</button>
+        <button id="relayout-btn" class="icon-btn" title="Re-run layout">Layout</button>
       </div>
       <div id="cy"></div>
+      <div id="graph-tooltip" hidden></div>
+      <div id="graph-empty-state" class="empty-state">
+        <p>Nothing to show yet.</p>
+        <p class="muted">Run a query on the left, or click "Show full graph".</p>
+      </div>
     </main>
   </div>
 
